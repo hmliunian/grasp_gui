@@ -146,6 +146,28 @@
             max-width: 100%;
             border: 2px solid #ddd;
             border-radius: 5px;
+            cursor: crosshair;
+        }
+        .mask-preview-container {
+            position: relative;
+            display: inline-block;
+        }
+        .excluded-region {
+            position: absolute;
+            border: 3px solid red;
+            background: rgba(255, 0, 0, 0.1);
+            pointer-events: none;
+            box-sizing: border-box;
+        }
+        .exclusion-section {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }
+        .exclusion-section h4 {
+            margin-top: 0;
+            color: #495057;
         }
         .loading {
             display: none;
@@ -228,7 +250,18 @@
 
             <div class="result-section" id="resultSection" style="display: none;">
                 <h3>Segmentation Result</h3>
-                <img id="maskPreview" alt="Mask Preview">
+                <div class="mask-preview-container" id="maskPreviewContainer">
+                    <img id="maskPreview" alt="Mask Preview">
+                </div>
+                <div class="exclusion-section" id="regionSection" style="display: none;">
+                    <h4>Select 10x10 Region</h4>
+                    <p>Click on the mask preview above to select a 10x10 pixel region. Only one region can be selected.</p>
+                    <div class="controls">
+                        <button class="btn btn-success" id="downloadRegionBtn" style="display: none;">Download Region Mask</button>
+                        <button class="btn btn-danger" id="clearRegionBtn">Clear Selection</button>
+                    </div>
+                    <p id="regionInfo">Selected region: None</p>
+                </div>
             </div>
         </div>
     </div>
@@ -241,6 +274,10 @@
         let labels = [];
         let imageScale = 1;
         let imageOffset = { x: 0, y: 0 };
+        let justDropped = false;
+        let selectedRegion = null;  // Store selected 10x10 region: {x, y} or null
+        let maskPreviewScale = 1;  // Scale factor for mask preview image
+        let originalImageSize = { width: 0, height: 0 };  // Original image dimensions
 
         // DOM elements
         const uploadArea = document.getElementById('uploadArea');
@@ -255,9 +292,19 @@
         const loading = document.getElementById('loading');
         const resultSection = document.getElementById('resultSection');
         const maskPreview = document.getElementById('maskPreview');
+        const maskPreviewContainer = document.getElementById('maskPreviewContainer');
+        const regionSection = document.getElementById('regionSection');
+        const downloadRegionBtn = document.getElementById('downloadRegionBtn');
+        const clearRegionBtn = document.getElementById('clearRegionBtn');
+        const regionInfo = document.getElementById('regionInfo');
 
         // Upload handling
-        uploadArea.addEventListener('click', () => imageInput.click());
+        uploadArea.addEventListener('click', (e) => {
+            // Only trigger file input if not recently dropped
+            if (!justDropped) {
+                imageInput.click();
+            }
+        });
         uploadArea.addEventListener('dragover', (e) => {
             e.preventDefault();
             uploadArea.classList.add('dragover');
@@ -267,11 +314,17 @@
         });
         uploadArea.addEventListener('drop', (e) => {
             e.preventDefault();
+            e.stopPropagation();
             uploadArea.classList.remove('dragover');
+            justDropped = true;
             const files = e.dataTransfer.files;
             if (files.length > 0) {
                 handleFileUpload(files[0]);
             }
+            // Reset flag after a delay to prevent accidental clicks
+            setTimeout(() => {
+                justDropped = false;
+            }, 500);
         });
 
         imageInput.addEventListener('change', (e) => {
@@ -311,6 +364,10 @@
             img.onload = function() {
                 canvas = imageCanvas;
                 ctx = canvas.getContext('2d');
+
+                // Store original image size
+                originalImageSize.width = img.width;
+                originalImageSize.height = img.height;
 
                 // Calculate scaling to fit canvas
                 const maxWidth = 800;
@@ -426,9 +483,31 @@
             .then(data => {
                 loading.style.display = 'none';
                 if (data.success) {
+                    // Clear any existing region
+                    selectedRegion = null;
+                    
+                    // Store original image size
+                    if (data.image_size) {
+                        originalImageSize.width = data.image_size.width;
+                        originalImageSize.height = data.image_size.height;
+                    }
+                    
+                    // Set up onload handler before setting src
+                    maskPreview.onload = function() {
+                        // Calculate scale factor: original image width / displayed preview width
+                        maskPreviewScale = originalImageSize.width / maskPreview.width;
+                        updateRegionDisplay();
+                    };
+                    
                     maskPreview.src = data.mask_preview;
                     resultSection.style.display = 'block';
                     saveBtn.style.display = 'inline-block';
+                    regionSection.style.display = 'block';
+                    
+                    // If image already loaded, trigger onload manually
+                    if (maskPreview.complete) {
+                        maskPreview.onload();
+                    }
                 } else {
                     alert('Error: ' + data.error);
                 }
@@ -517,9 +596,107 @@
         clearBtn.addEventListener('click', () => {
             points = [];
             labels = [];
+            selectedRegion = null;
             redrawCanvas();
             resultSection.style.display = 'none';
             saveBtn.style.display = 'none';
+            regionSection.style.display = 'none';
+            updateRegionDisplay();
+        });
+
+        // Mask preview click handling for selecting 100x100 region
+        maskPreview.addEventListener('click', (e) => {
+            if (!maskPreview.src || maskPreview.src === '') return;
+
+            const rect = maskPreview.getBoundingClientRect();
+            const clickX = e.clientX - rect.left;
+            const clickY = e.clientY - rect.top;
+
+            // Convert to original image coordinates
+            const originalX = Math.floor(clickX * maskPreviewScale);
+            const originalY = Math.floor(clickY * maskPreviewScale);
+
+            // Calculate the top-left corner of the 10x10 region (centered on click)
+            const regionX = Math.max(0, Math.min(originalX - 5, originalImageSize.width - 10));
+            const regionY = Math.max(0, Math.min(originalY - 5, originalImageSize.height - 10));
+
+            // Check if clicking on existing region (remove it) or select new one
+            if (selectedRegion && selectedRegion.x === regionX && selectedRegion.y === regionY) {
+                selectedRegion = null;
+            } else {
+                selectedRegion = { x: regionX, y: regionY };
+            }
+            updateRegionDisplay();
+        });
+
+        function updateRegionDisplay() {
+            // Clear existing region display
+            const existingRegions = maskPreviewContainer.querySelectorAll('.excluded-region');
+            existingRegions.forEach(region => region.remove());
+
+            // Add visual indicator for selected region
+            if (selectedRegion) {
+                const div = document.createElement('div');
+                div.className = 'excluded-region';
+                div.style.left = (selectedRegion.x / maskPreviewScale) + 'px';
+                div.style.top = (selectedRegion.y / maskPreviewScale) + 'px';
+                div.style.width = (10 / maskPreviewScale) + 'px';
+                div.style.height = (10 / maskPreviewScale) + 'px';
+                maskPreviewContainer.appendChild(div);
+                regionInfo.textContent = `Selected region: (${selectedRegion.x}, ${selectedRegion.y})`;
+                downloadRegionBtn.style.display = 'inline-block';
+            } else {
+                regionInfo.textContent = 'Selected region: None';
+                downloadRegionBtn.style.display = 'none';
+            }
+        }
+
+        // Download region mask
+        downloadRegionBtn.addEventListener('click', () => {
+            if (!selectedRegion) {
+                alert('Please select a 10x10 region first.');
+                return;
+            }
+
+            loading.style.display = 'block';
+
+            fetch('/download_region_mask', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    x: selectedRegion.x,
+                    y: selectedRegion.y
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(data => Promise.reject(new Error(data.error || 'Download failed')));
+                }
+                return response.blob();
+            })
+            .then(blob => {
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'region_mask_fullsize.png';
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                document.body.removeChild(a);
+                loading.style.display = 'none';
+            })
+            .catch(error => {
+                loading.style.display = 'none';
+                alert('Download failed: ' + error.message);
+            });
+        });
+
+        // Clear region
+        clearRegionBtn.addEventListener('click', () => {
+            selectedRegion = null;
+            updateRegionDisplay();
         });
     </script>
 </body>

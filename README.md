@@ -8,6 +8,7 @@ A web-based graphical user interface for SAM3 (Segment Anything Model 3) image s
 - **Interactive Point Selection**: Add positive (foreground) and negative (background) points by clicking
 - **Real-time Preview**: Generate and preview segmentation masks
 - **Save Results**: Download both the mask and combined overlay image
+- **Placement Point Selection**: Select a 10x10 pixel region on the mask preview as placement point (independent of SAM3 mask)
 
 ## Installation
 
@@ -38,6 +39,8 @@ python sam_gui.py
 6. Click "Generate Mask" to see the segmentation result
 
 7. Click "Save Result" to download the mask and combined image
+
+8. (Optional) Click on the mask preview to select a 10x10 pixel region as placement point, then click "Download Region Mask" to save it
 
 ## API Endpoints
 
