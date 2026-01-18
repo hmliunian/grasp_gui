@@ -5,6 +5,7 @@ A web-based graphical user interface for SAM3 (Segment Anything Model 3) image s
 ## Features
 
 - **Image Upload**: Drag and drop or click to upload images
+- **Random Pixel Video**: Generate random pixel video and capture a frame as input image
 - **Interactive Point Selection**: Add positive (foreground) and negative (background) points by clicking
 - **Real-time Preview**: Generate and preview segmentation masks
 - **Save Results**: Download both the mask and combined overlay image
@@ -28,7 +29,9 @@ python sam_gui.py
 
 2. Open your web browser and navigate to `http://localhost:50052`
 
-3. Upload an image using the upload area
+3. Upload an image using one of the following methods:
+   - **Method 1**: Click the upload area or drag and drop an image file
+   - **Method 2**: Click "Generate Random Pixel Video" to create a random pixel video, then click "Stop & Use Current Frame" to capture the current frame as input image
 
 4. Select point mode:
    - **Positive Point (Green)**: Click to mark foreground regions
