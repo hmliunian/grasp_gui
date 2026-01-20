@@ -21,21 +21,6 @@
             overflow-x: hidden;
         }
 
-        .header {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            padding: 20px;
-            text-align: center;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .header h1 {
-            color: #ffffff;
-            font-size: 28px;
-            font-weight: 600;
-            letter-spacing: 1px;
-        }
-
         .main-container {
             display: flex;
             flex: 1;
@@ -276,6 +261,12 @@
             box-sizing: border-box;
         }
 
+        #externalModeControls {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
         @media (max-width: 1024px) {
             .main-container {
                 flex-direction: column;
@@ -292,10 +283,6 @@
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🎯 SAM3 Web GUI</h1>
-    </div>
-
     <div class="main-container">
         <!-- Left: Canvas Section -->
         <div class="canvas-section">
@@ -349,16 +336,16 @@
                 Step 4: Generate Mask (SAM3)
             </button>
             
-            <!-- Step 4B: External Mode Controls -->
+            <!-- Step 3 & 4: External Mode Controls -->
             <div id="externalModeControls" style="display: none;">
-                <button class="step-button step-4" id="btnSendImage" disabled>
-                    Step 4A: Send Image
+                <button class="step-button step-3" id="btnSendImage" disabled>
+                    Step 3: Send Image
                 </button>
                 <div class="status-info" id="statusSendImage" style="display: none;">
                     Image sent. Waiting for mask...
                 </div>
                 <button class="step-button step-4" id="btnReceiveMask" disabled>
-                    Step 4B: Confirm Mask
+                    Step 4: Confirm Mask
                 </button>
                 <div class="status-info" id="statusReceiveMask" style="display: none;">
                     Waiting for mask from external service...
@@ -482,6 +469,11 @@
             btnAddPoints.style.display = 'block';
             btnGenerateMask.style.display = 'block';
             externalModeControls.style.display = 'none';
+            // Hide positive/negative selector if not in step 3
+            if (state.step < 3) {
+                modeSelector.style.display = 'none';
+                statusPoints.style.display = 'none';
+            }
             // Reset mask-related state when switching modes
             if (state.step < 4) {
                 state.step = Math.min(state.step, 2);
@@ -509,6 +501,9 @@
             btnAddPoints.style.display = 'none';
             btnGenerateMask.style.display = 'none';
             externalModeControls.style.display = 'block';
+            // Hide positive/negative selector in external mode
+            modeSelector.style.display = 'none';
+            statusPoints.style.display = 'none';
             // Reset mask-related state when switching modes
             if (state.step < 4) {
                 state.step = Math.min(state.step, 2);
