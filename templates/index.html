@@ -310,6 +310,15 @@
 
         <!-- Right: Control Section -->
         <div class="control-section">
+            <!-- Mode Selector -->
+            <div class="status-info" style="margin-bottom: 16px;">
+                <div style="margin-bottom: 8px; font-weight: 600;">Mask Source Mode:</div>
+                <div class="mode-selector" id="maskModeSelector">
+                    <button class="mode-btn positive" id="btnModeSam3" style="flex: 1;">SAM3</button>
+                    <button class="mode-btn negative" id="btnModeExternal" style="flex: 1;">External</button>
+                </div>
+            </div>
+
             <!-- Step 1: Start Video -->
             <button class="step-button step-1" id="btnStartVideo">
                 Step 1: Start Video
@@ -323,8 +332,8 @@
                 Video stopped. Frame captured.
             </div>
 
-            <!-- Step 3: Add Points -->
-            <button class="step-button step-3" id="btnAddPoints" disabled>
+            <!-- Step 3: Add Points (SAM3 mode only) -->
+            <button class="step-button step-3" id="btnAddPoints" disabled style="display: none;">
                 Step 3: Add Points
             </button>
             <div class="mode-selector" id="modeSelector" style="display: none;">
@@ -335,10 +344,27 @@
                 Points: <span id="pointCount">0</span>
             </div>
 
-            <!-- Step 4: Generate Mask -->
-            <button class="step-button step-4" id="btnGenerateMask" disabled>
-                Step 4: Generate Mask
+            <!-- Step 4A: SAM3 Generate Mask -->
+            <button class="step-button step-4" id="btnGenerateMask" disabled style="display: none;">
+                Step 4: Generate Mask (SAM3)
             </button>
+            
+            <!-- Step 4B: External Mode Controls -->
+            <div id="externalModeControls" style="display: none;">
+                <button class="step-button step-4" id="btnSendImage" disabled>
+                    Step 4A: Send Image
+                </button>
+                <div class="status-info" id="statusSendImage" style="display: none;">
+                    Image sent. Waiting for mask...
+                </div>
+                <button class="step-button step-4" id="btnReceiveMask" disabled>
+                    Step 4B: Confirm Mask
+                </button>
+                <div class="status-info" id="statusReceiveMask" style="display: none;">
+                    Waiting for mask from external service...
+                </div>
+            </div>
+            
             <div class="status-info" id="statusMask" style="display: none;">
                 Mask generated successfully.
             </div>
@@ -348,7 +374,7 @@
                 Step 5: Select Place Point
             </button>
             <div class="status-info" id="statusPlace" style="display: none;">
-                Click on overlay to select 10x10 region.
+                Click on overlay to select placement point (uses current mask if available).
             </div>
 
             <!-- Step 6: Download -->
@@ -378,7 +404,8 @@
             currentMode: 'positive', // 'positive' or 'negative'
             selectedPlace: null,
             imageSize: { width: 0, height: 0 },
-            canvasScale: 1
+            canvasScale: 1,
+            maskSourceMode: 'sam3' // 'sam3' or 'external'
         };
 
         // DOM elements
@@ -398,6 +425,16 @@
         const btnDownloadOverlay = document.getElementById('btnDownloadOverlay');
         const btnDownloadMask = document.getElementById('btnDownloadMask');
         const btnDownloadPlace = document.getElementById('btnDownloadPlace');
+        const btnModeSam3 = document.getElementById('btnModeSam3');
+        const btnModeExternal = document.getElementById('btnModeExternal');
+        const btnSendImage = document.getElementById('btnSendImage');
+        const btnReceiveMask = document.getElementById('btnReceiveMask');
+        const externalModeControls = document.getElementById('externalModeControls');
+        const statusSendImage = document.getElementById('statusSendImage');
+        const statusReceiveMask = document.getElementById('statusReceiveMask');
+        
+        // External mode polling for preview
+        let externalPreviewInterval = null;
 
         // Status elements
         const statusVideo = document.getElementById('statusVideo');
@@ -424,11 +461,179 @@
         function updateButtonStates() {
             btnStartVideo.disabled = state.step >= 1;
             btnStopVideo.disabled = state.step < 1;
-            btnAddPoints.disabled = state.step < 2;
-            btnGenerateMask.disabled = state.step < 3 || state.points.length === 0;
+            
+            if (state.maskSourceMode === 'sam3') {
+                btnAddPoints.disabled = state.step < 2;
+                btnGenerateMask.disabled = state.step < 3 || state.points.length === 0;
+            } else {
+                btnSendImage.disabled = state.step < 2;
+                btnReceiveMask.disabled = state.step < 2;
+            }
+            
             btnSelectPlace.disabled = state.step < 4;
             btnDownload.disabled = state.step < 4;
         }
+
+        // Mode selection handlers
+        btnModeSam3.addEventListener('click', () => {
+            state.maskSourceMode = 'sam3';
+            btnModeSam3.classList.add('active');
+            btnModeExternal.classList.remove('active');
+            btnAddPoints.style.display = 'block';
+            btnGenerateMask.style.display = 'block';
+            externalModeControls.style.display = 'none';
+            // Reset mask-related state when switching modes
+            if (state.step < 4) {
+                state.step = Math.min(state.step, 2);
+                state.currentMask = null;
+                state.currentOverlay = null;
+                state.points = [];
+                state.labels = [];
+                statusMask.style.display = 'none';
+                statusSendImage.style.display = 'none';
+                statusReceiveMask.style.display = 'none';
+                downloadOptions.style.display = 'none';
+                // Stop external preview polling
+                if (externalPreviewInterval) {
+                    clearInterval(externalPreviewInterval);
+                    externalPreviewInterval = null;
+                }
+            }
+            updateButtonStates();
+        });
+
+        btnModeExternal.addEventListener('click', () => {
+            state.maskSourceMode = 'external';
+            btnModeExternal.classList.add('active');
+            btnModeSam3.classList.remove('active');
+            btnAddPoints.style.display = 'none';
+            btnGenerateMask.style.display = 'none';
+            externalModeControls.style.display = 'block';
+            // Reset mask-related state when switching modes
+            if (state.step < 4) {
+                state.step = Math.min(state.step, 2);
+                state.currentMask = null;
+                state.currentOverlay = null;
+                state.points = [];
+                state.labels = [];
+                statusMask.style.display = 'none';
+                statusSendImage.style.display = 'none';
+                statusReceiveMask.style.display = 'none';
+                downloadOptions.style.display = 'none';
+                // Stop external preview polling
+                if (externalPreviewInterval) {
+                    clearInterval(externalPreviewInterval);
+                    externalPreviewInterval = null;
+                }
+            }
+            updateButtonStates();
+        });
+
+        // Initialize mode to SAM3
+        btnModeSam3.classList.add('active');
+
+        // External mode: Send Image
+        btnSendImage.addEventListener('click', async () => {
+            loading.style.display = 'block';
+
+            try {
+                const response = await fetch('/external/send_image', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                const data = await response.json();
+                if (data.success) {
+                    statusSendImage.style.display = 'block';
+                    statusReceiveMask.style.display = 'block';
+                    
+                    // Start polling for preview mask
+                    startExternalPreviewPolling();
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (error) {
+                console.error('Error sending image:', error);
+                alert('Failed to send image: ' + error.message);
+            } finally {
+                loading.style.display = 'none';
+            }
+        });
+
+        // External mode: Poll for preview mask
+        function startExternalPreviewPolling() {
+            // Clear existing interval
+            if (externalPreviewInterval) {
+                clearInterval(externalPreviewInterval);
+            }
+            
+            // Poll every 2 seconds for preview
+            externalPreviewInterval = setInterval(async () => {
+                try {
+                    const response = await fetch('/external/receive_mask');
+                    const data = await response.json();
+                    
+                    if (data.success && data.preview) {
+                        // Update preview display (don't set state.step or lock)
+                        const img = new Image();
+                        img.onload = () => {
+                            ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
+                        };
+                        img.src = data.overlay_data;
+                        
+                        // Update status
+                        statusReceiveMask.textContent = 'Mask received. Click "Confirm Mask" to use it.';
+                    } else if (data.success && data.locked) {
+                        // Already confirmed, stop polling
+                        clearInterval(externalPreviewInterval);
+                        externalPreviewInterval = null;
+                    }
+                } catch (error) {
+                    // Silently ignore errors during polling
+                    console.debug('Preview polling error:', error);
+                }
+            }, 2000); // Poll every 2 seconds
+        }
+
+        // External mode: Confirm Mask
+        btnReceiveMask.addEventListener('click', async () => {
+            loading.style.display = 'block';
+
+            try {
+                // Stop polling
+                if (externalPreviewInterval) {
+                    clearInterval(externalPreviewInterval);
+                    externalPreviewInterval = null;
+                }
+
+                const response = await fetch('/external/receive_mask?confirm=true');
+                const data = await response.json();
+                
+                if (data.success) {
+                    state.currentOverlay = data.overlay_data;
+                    state.currentMask = data.mask_data;
+                    state.step = 4;
+                    updateButtonStates();
+                    statusMask.style.display = 'block';
+                    statusReceiveMask.style.display = 'none';
+                    downloadOptions.style.display = 'flex';
+
+                    // Display overlay
+                    const img = new Image();
+                    img.onload = () => {
+                        ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
+                    };
+                    img.src = data.overlay_data;
+                } else {
+                    alert('Error: ' + data.error);
+                }
+            } catch (error) {
+                console.error('Error confirming mask:', error);
+                alert('Failed to confirm mask: ' + error.message);
+            } finally {
+                loading.style.display = 'none';
+            }
+        });
 
         // Step 1: Start Video
         btnStartVideo.addEventListener('click', async () => {
@@ -519,6 +724,20 @@
                     state.currentImage = data.image_data;
                     state.imageSize = data.image_size;
                     state.step = 2;
+                    // Reset mask-related state for new image
+                    state.currentMask = null;
+                    state.currentOverlay = null;
+                    state.points = [];
+                    state.labels = [];
+                    statusMask.style.display = 'none';
+                    statusSendImage.style.display = 'none';
+                    statusReceiveMask.style.display = 'none';
+                    downloadOptions.style.display = 'none';
+                    // Stop external preview polling
+                    if (externalPreviewInterval) {
+                        clearInterval(externalPreviewInterval);
+                        externalPreviewInterval = null;
+                    }
                     updateButtonStates();
                     statusVideo.style.display = 'block';
                     loading.style.display = 'none';
@@ -634,7 +853,7 @@
             pointCount.textContent = state.points.length;
         }
 
-        // Step 4: Generate Mask
+        // Step 4: Generate Mask (SAM3 mode only)
         btnGenerateMask.addEventListener('click', async () => {
             if (state.points.length === 0) {
                 alert('Please add at least one point first.');
@@ -644,7 +863,7 @@
             loading.style.display = 'block';
 
             try {
-                const response = await fetch('/predict_mask', {
+                const response = await fetch('/sam3/predict_mask', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({

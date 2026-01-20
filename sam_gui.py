@@ -9,6 +9,7 @@ import torch
 from PIL import Image
 import matplotlib.pyplot as plt
 from flask import Flask, render_template, request, jsonify, send_file
+import requests
 import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
@@ -30,6 +31,18 @@ video_running = False
 current_mask = None
 current_overlay = None
 place_mask = None
+mask_source_mode = None  # 'sam3', 'external', or None
+
+# External mode state (independent from SAM3)
+# Can be configured via environment variable EXTERNAL_SERVICE_URL
+# Default: http://localhost:50053/api/process_image (for local testing)
+# For production, set: export EXTERNAL_SERVICE_URL="http://external-service.com/api/process_image"
+EXTERNAL_SERVICE_URL = os.getenv(
+    "EXTERNAL_SERVICE_URL", 
+    "http://localhost:50053/api/process_image"  # Default to local test receiver
+)
+external_mask_buffer = None  # Buffer for temporarily storing received mask (numpy array)
+external_mask_locked = False  # Lock flag: if True, no longer accept new masks
 
 # -------------------------------
 # Device setup
@@ -226,10 +239,18 @@ def start_video():
 
 @app.route('/stop_video', methods=['POST'])
 def stop_video():
-    """Stop video and save last frame as current_image for SAM3"""
-    global video_running, current_image, current_inference_state
+    """Stop video and save last frame as current_image (shared endpoint)"""
+    global video_running, current_image, current_inference_state, current_mask, current_overlay, mask_source_mode
+    global external_mask_buffer, external_mask_locked
     
     video_running = False
+    
+    # Reset mask-related state for new image
+    current_mask = None
+    current_overlay = None
+    mask_source_mode = None
+    external_mask_buffer = None
+    external_mask_locked = False
     
     # Get last frame from request (or generate one)
     data = request.get_json() or {}
@@ -261,8 +282,8 @@ def stop_video():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    # Generate inference state
-    current_inference_state = processor.set_image(current_image)
+    # Note: SAM3 inference state will be initialized lazily in /sam3/predict_mask if needed
+    # This endpoint does NOT touch SAM3 model, making it compatible with External mode
     
     # Save current image
     filename = os.path.join(app.config['UPLOAD_FOLDER'], 'current_image.jpg')
@@ -282,7 +303,9 @@ def stop_video():
 
 @app.route('/upload', methods=['POST'])
 def upload_image():
-    global current_image, current_inference_state
+    """Upload image (shared endpoint, compatible with both modes)"""
+    global current_image, current_inference_state, current_mask, current_overlay, mask_source_mode
+    global external_mask_buffer, external_mask_locked
 
     if 'image' not in request.files:
         return jsonify({'error': 'No image file provided'}), 400
@@ -306,15 +329,22 @@ def upload_image():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
+        # Reset mask-related state for new image
+        current_mask = None
+        current_overlay = None
+        mask_source_mode = None
+        external_mask_buffer = None
+        external_mask_locked = False
+        
         # Save uploaded image
         filename = os.path.join(app.config['UPLOAD_FOLDER'], 'current_image.jpg')
         file.save(filename)
 
-        # Load and process image
+        # Load image
         current_image = Image.open(filename).convert("RGB")
 
-        # Generate inference state
-        current_inference_state = processor.set_image(current_image)
+        # Note: SAM3 inference state will be initialized lazily in /sam3/predict_mask if needed
+        # This endpoint does NOT touch SAM3 model, making it compatible with External mode
 
         # Convert to base64 for display
         buffered = io.BytesIO()
@@ -329,16 +359,25 @@ def upload_image():
 
 @app.route('/predict', methods=['POST'])
 def predict_mask():
-    """Legacy endpoint - kept for compatibility"""
-    return predict_mask_new()
+    """Legacy endpoint - redirects to SAM3 mode"""
+    return sam3_predict_mask()
 
 @app.route('/predict_mask', methods=['POST'])
 def predict_mask_new():
-    """Generate mask from points, return overlay and mask"""
-    global current_image, current_inference_state, current_mask, current_overlay
+    """Legacy endpoint - redirects to SAM3 mode"""
+    return sam3_predict_mask()
 
-    if current_image is None or current_inference_state is None:
+@app.route('/sam3/predict_mask', methods=['POST'])
+def sam3_predict_mask():
+    """SAM3 mode: Generate mask from points using SAM3 model"""
+    global current_image, current_inference_state, current_mask, current_overlay, mask_source_mode
+
+    if current_image is None:
         return jsonify({'error': 'No image loaded. Please stop video first.'}), 400
+    
+    # Lazy initialization of SAM3 inference state (only in SAM3 mode)
+    if current_inference_state is None:
+        current_inference_state = processor.set_image(current_image)
 
     data = request.get_json()
     points = data.get('points', [])
@@ -351,7 +390,7 @@ def predict_mask_new():
         points_array = np.array(points)
         labels_array = np.array(labels)
 
-        # Predict mask and convert to numpy
+        # Predict mask using SAM3 model
         masks, scores, logits = predict_mask_from_points(points_array, labels_array)
 
         # Save mask (single channel 0-255)
@@ -360,6 +399,9 @@ def predict_mask_new():
         # Create overlay (semi-transparent blue mask over original image)
         overlay = create_overlay_image(current_image, masks[0], points_array, labels_array)
         current_overlay = overlay
+
+        # Set mask source mode
+        mask_source_mode = 'sam3'
 
         # Convert overlay to base64
         buffered = io.BytesIO()
@@ -389,6 +431,192 @@ def predict_mask_new():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/external/send_image', methods=['POST'])
+def external_send_image():
+    """External mode: Send current image to external URL (hardcoded, independent from SAM3)"""
+    global current_image, external_mask_buffer, external_mask_locked
+
+    if current_image is None:
+        return jsonify({'error': 'No image loaded'}), 400
+
+    try:
+        # Encode image to Base64 PNG
+        buffered = io.BytesIO()
+        current_image.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+        # Send JSON to hardcoded external URL
+        payload = {
+            'image': f"data:image/png;base64,{img_base64}",
+            'width': current_image.width,
+            'height': current_image.height
+        }
+
+        # Send with 10s timeout
+        response = requests.post(EXTERNAL_SERVICE_URL, json=payload, timeout=10)
+        response.raise_for_status()
+
+        # Reset external mask state when sending new image
+        external_mask_buffer = None
+        external_mask_locked = False
+
+        return jsonify({
+            'success': True,
+            'status_code': response.status_code,
+            'message': 'Image sent to external service'
+        })
+
+    except requests.exceptions.Timeout:
+        return jsonify({'error': 'Request timeout: External service did not respond within 10 seconds'}), 500
+    except requests.exceptions.RequestException as e:
+        return jsonify({'error': f'Failed to send image to external service: {str(e)}'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/external/receive_mask', methods=['POST', 'GET'])
+def external_receive_mask():
+    """External mode: Receive mask from external source (POST) or preview/confirm mask (GET)"""
+    global current_image, current_mask, current_overlay, mask_source_mode
+    global external_mask_buffer, external_mask_locked
+
+    if current_image is None:
+        return jsonify({'error': 'No image loaded'}), 400
+
+    if request.method == 'POST':
+        # External service pushes mask (passive receive)
+        if external_mask_locked:
+            return jsonify({
+                'success': False,
+                'message': 'Mask already confirmed. No longer accepting new masks.'
+            }), 200
+
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        mask_data = data.get('mask_data')  # Base64 encoded mask
+
+        if not mask_data:
+            return jsonify({'error': 'mask_data not provided'}), 400
+
+        try:
+            # Decode Base64 mask
+            if mask_data.startswith('data:image'):
+                mask_data = mask_data.split(',')[1]
+            mask_bytes = base64.b64decode(mask_data)
+            
+            # Load mask image
+            mask_img = Image.open(io.BytesIO(mask_bytes)).convert('L')
+            
+            # Resize to current_image dimensions
+            h, w = current_image.height, current_image.width
+            mask_img = mask_img.resize((w, h), Image.Resampling.LANCZOS)
+            
+            # Convert to numpy uint8 array (0-255)
+            mask_array = np.array(mask_img, dtype=np.uint8)
+            
+            # Ensure values are 0-255
+            mask_array = np.clip(mask_array, 0, 255)
+            
+            # Store in buffer (do NOT set current_mask yet)
+            external_mask_buffer = mask_array
+            
+            return jsonify({
+                'success': True,
+                'message': 'Mask received and stored in buffer'
+            })
+
+        except Exception as e:
+            return jsonify({'error': f'Failed to process mask: {str(e)}'}), 500
+
+    elif request.method == 'GET':
+        # Frontend preview or confirm mask
+        confirm = request.args.get('confirm', 'false').lower() == 'true'
+        
+        if external_mask_buffer is None:
+            return jsonify({'error': 'No mask in buffer. Please wait for external service to send mask.'}), 400
+
+        if confirm:
+            # Confirm button clicked: set current_mask and lock
+            if external_mask_locked:
+                # Already confirmed, return current mask
+                buffered_overlay = io.BytesIO()
+                current_overlay.save(buffered_overlay, format="PNG")
+                overlay_base64 = base64.b64encode(buffered_overlay.getvalue()).decode('utf-8')
+                
+                mask_img = Image.fromarray(current_mask, mode='L')
+                buffered_mask = io.BytesIO()
+                mask_img.save(buffered_mask, format="PNG")
+                mask_base64 = base64.b64encode(buffered_mask.getvalue()).decode('utf-8')
+                
+                return jsonify({
+                    'success': True,
+                    'overlay_data': f"data:image/png;base64,{overlay_base64}",
+                    'mask_data': f"data:image/png;base64,{mask_base64}",
+                    'image_size': {'width': current_image.width, 'height': current_image.height},
+                    'locked': True
+                })
+
+            try:
+                # Set current_mask from buffer
+                current_mask = external_mask_buffer.copy()
+                mask_source_mode = 'external'
+                
+                # Create overlay
+                mask_float = current_mask.astype(np.float32) / 255.0
+                overlay = create_overlay_image(current_image, mask_float)
+                current_overlay = overlay
+                
+                # Lock: no longer accept new masks
+                external_mask_locked = True
+                
+                # Convert overlay to base64
+                buffered = io.BytesIO()
+                overlay.save(buffered, format="PNG")
+                overlay_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+                # Convert mask to base64
+                mask_img = Image.fromarray(current_mask, mode='L')
+                buffered_mask = io.BytesIO()
+                mask_img.save(buffered_mask, format="PNG")
+                mask_base64 = base64.b64encode(buffered_mask.getvalue()).decode('utf-8')
+
+                return jsonify({
+                    'success': True,
+                    'overlay_data': f"data:image/png;base64,{overlay_base64}",
+                    'mask_data': f"data:image/png;base64,{mask_base64}",
+                    'image_size': {'width': current_image.width, 'height': current_image.height}
+                })
+
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+        else:
+            # Preview: return buffer mask for display (without locking)
+            try:
+                # Create preview overlay from buffer
+                mask_float = external_mask_buffer.astype(np.float32) / 255.0
+                preview_overlay = create_overlay_image(current_image, mask_float)
+                
+                # Convert to base64
+                buffered = io.BytesIO()
+                preview_overlay.save(buffered, format="PNG")
+                overlay_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                
+                mask_img = Image.fromarray(external_mask_buffer, mode='L')
+                buffered_mask = io.BytesIO()
+                mask_img.save(buffered_mask, format="PNG")
+                mask_base64 = base64.b64encode(buffered_mask.getvalue()).decode('utf-8')
+                
+                return jsonify({
+                    'success': True,
+                    'overlay_data': f"data:image/png;base64,{overlay_base64}",
+                    'mask_data': f"data:image/png;base64,{mask_base64}",
+                    'image_size': {'width': current_image.width, 'height': current_image.height},
+                    'preview': True  # Indicate this is preview, not confirmed
+                })
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
+
 def create_overlay_image(image, mask, points=None, labels=None):
     """Create overlay image with semi-transparent blue mask"""
     fig, ax = plt.subplots(figsize=(10, 10))
@@ -415,10 +643,15 @@ def create_overlay_image(image, mask, points=None, labels=None):
 
 @app.route('/download_mask', methods=['POST'])
 def download_mask():
+    """Legacy SAM3 endpoint: Download mask directly from points"""
     global current_image, current_inference_state
 
-    if current_image is None or current_inference_state is None:
+    if current_image is None:
         return jsonify({'error': 'No image loaded'}), 400
+    
+    # Lazy initialization of SAM3 inference state
+    if current_inference_state is None:
+        current_inference_state = processor.set_image(current_image)
 
     data = request.get_json()
     points = data.get('points', [])
@@ -458,10 +691,15 @@ def download_mask():
 
 @app.route('/download_combined', methods=['POST'])
 def download_combined():
+    """Legacy SAM3 endpoint: Download combined image with mask overlay"""
     global current_image, current_inference_state
 
-    if current_image is None or current_inference_state is None:
+    if current_image is None:
         return jsonify({'error': 'No image loaded'}), 400
+    
+    # Lazy initialization of SAM3 inference state
+    if current_inference_state is None:
+        current_inference_state = processor.set_image(current_image)
 
     data = request.get_json()
     points = data.get('points', [])
@@ -510,7 +748,7 @@ def download_combined():
 
 @app.route('/select_place', methods=['POST'])
 def select_place():
-    """Select 10x10 placement point region, return full-size mask"""
+    """Select placement point region: always create a 10x10 region mask"""
     global current_image, place_mask
 
     if current_image is None:
@@ -525,15 +763,18 @@ def select_place():
 
     try:
         h, w = current_image.height, current_image.width
+        x = int(x)
+        y = int(y)
         
-        # Ensure coordinates are within valid range
-        x = max(0, min(int(x), w - 10))
-        y = max(0, min(int(y), h - 10))
-
-        # Create full-size black background mask (single channel grayscale)
-        # Black background (0) + white selected region (255)
+        # place_mask is ALWAYS a 10x10 region mask (independent from current_mask)
+        # current_mask is the segmentation mask from Step 4 (SAM3 or External)
+        # place_mask is the placement region from Step 5 (10x10 box)
+        x = max(0, min(x, w - 10))
+        y = max(0, min(y, h - 10))
         full_mask = np.zeros((h, w), dtype=np.uint8)
         full_mask[y:y+10, x:x+10] = 255
+        
+        # Set place_mask (always a 10x10 region, never current_mask)
         place_mask = full_mask
 
         # Convert to base64 for preview
@@ -580,6 +821,7 @@ def download():
         )
     
     elif download_type == 'mask':
+        # Download current_mask (mask_output) - the mask from Step 4
         if current_mask is None:
             return jsonify({'error': 'No mask available. Please generate mask first.'}), 400
         mask_image = Image.fromarray(current_mask, mode='L')
@@ -590,10 +832,14 @@ def download():
             buf,
             mimetype='image/png',
             as_attachment=True,
-            download_name='mask_output.png'
+            download_name='mask_output.png'  # This is current_mask from Step 4
         )
     
     elif download_type == 'place_mask':
+        # Download place_mask - the placement mask from Step 5 (always a 10x10 region)
+        # Note: place_mask is different from current_mask (mask_output)
+        # - current_mask: segmentation mask from Step 4 (SAM3 or External mode)
+        # - place_mask: 10x10 placement region from Step 5
         if place_mask is None:
             return jsonify({'error': 'No placement mask available. Please select placement point first.'}), 400
         mask_image = Image.fromarray(place_mask, mode='L')
@@ -604,7 +850,7 @@ def download():
             buf,
             mimetype='image/png',
             as_attachment=True,
-            download_name='place_mask.png'
+            download_name='place_mask.png'  # This is place_mask (10x10 region) from Step 5
         )
     
     else:
