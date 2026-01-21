@@ -3,39 +3,25 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SAM3 Web GUI</title>
+    <title>SAM3 Robot Teleop</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        /* --- Styles --- */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: #0a0a0a;
             color: #e0e0e0;
             min-height: 100vh;
             display: flex;
             flex-direction: column;
-            overflow-x: hidden;
         }
-
         .header {
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             padding: 20px;
             text-align: center;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
         }
-
-        .header h1 {
-            color: #ffffff;
-            font-size: 28px;
-            font-weight: 600;
-            letter-spacing: 1px;
-        }
-
+        .header h1 { color: #fff; font-size: 24px; }
         .main-container {
             display: flex;
             flex: 1;
@@ -45,788 +31,476 @@
             margin: 0 auto;
             width: 100%;
         }
-
         .canvas-section {
             flex: 1;
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            min-height: 600px;
-        }
-
-        .canvas-wrapper {
             position: relative;
+        }
+        .canvas-wrapper {
             background: #1a1a1a;
-            border-radius: 16px;
-            padding: 20px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6),
-                        0 0 0 1px rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 10px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
             display: inline-block;
         }
-
         #mainCanvas {
             max-width: 100%;
             max-height: 80vh;
-            border-radius: 8px;
+            border-radius: 4px;
             cursor: crosshair;
             display: block;
             background: #000;
         }
-
         .control-section {
             width: 320px;
             display: flex;
             flex-direction: column;
-            gap: 16px;
+            gap: 12px;
         }
-
         .step-button {
             width: 100%;
-            padding: 18px 24px;
+            padding: 15px;
             border: none;
-            border-radius: 12px;
-            font-size: 16px;
+            border-radius: 8px;
+            font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+            transition: transform 0.2s, opacity 0.2s;
+            color: white;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
         }
-
-        .step-button::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-            transition: left 0.5s;
-        }
-
-        .step-button:hover::before {
-            left: 100%;
-        }
-
         .step-button:disabled {
-            opacity: 0.4;
+            opacity: 0.3;
             cursor: not-allowed;
             transform: none !important;
+            box-shadow: none;
         }
-
-        .step-button:not(:disabled):hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
-        }
-
-        .step-button:not(:disabled):active {
-            transform: translateY(0);
-        }
-
-        .step-1 {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-        }
-
-        .step-2 {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-            color: white;
-        }
-
-        .step-3 {
-            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-            color: white;
-        }
-
-        .step-4 {
-            background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
-            color: white;
-        }
-
-        .step-5 {
-            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
-            color: white;
-        }
-
-        .step-6 {
-            background: linear-gradient(135deg, #30cfd0 0%, #330867 100%);
-            color: white;
-        }
-
-        .mode-selector {
-            display: flex;
-            gap: 12px;
-            margin-top: 8px;
-        }
-
-        .mode-btn {
-            flex: 1;
-            padding: 12px;
-            border: 2px solid;
-            border-radius: 8px;
-            background: transparent;
-            color: #e0e0e0;
-            cursor: pointer;
-            transition: all 0.3s;
-            font-weight: 500;
-        }
-
-        .mode-btn.positive {
-            border-color: #4ade80;
-            color: #4ade80;
-        }
-
-        .mode-btn.positive.active {
-            background: #4ade80;
-            color: #0a0a0a;
-        }
-
-        .mode-btn.negative {
-            border-color: #f87171;
-            color: #f87171;
-        }
-
-        .mode-btn.negative.active {
-            background: #f87171;
-            color: #0a0a0a;
-        }
-
-        .download-options {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            margin-top: 8px;
-        }
-
-        .download-btn {
-            padding: 12px;
-            border: 2px solid #4ade80;
-            border-radius: 8px;
-            background: transparent;
-            color: #4ade80;
-            cursor: pointer;
-            transition: all 0.3s;
-            font-weight: 500;
-        }
-
-        .download-btn:hover {
-            background: #4ade80;
-            color: #0a0a0a;
-        }
+        .step-button:not(:disabled):hover { transform: translateY(-2px); }
+        
+        .step-1 { background: #3b82f6; } /* Blue */
+        .step-2 { background: #ef4444; } /* Red */
+        .step-3 { background: #8b5cf6; } /* Purple */
+        .step-4 { background: #10b981; } /* Green */
+        .step-5 { background: #f59e0b; } /* Orange */
+        .step-6 { background: #ec4899; } /* Pink/Magenta for Action */
 
         .loading {
-            display: none;
-            text-align: center;
-            padding: 20px;
-        }
-
-        .spinner {
-            border: 3px solid rgba(255, 255, 255, 0.1);
-            border-top: 3px solid #667eea;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 10px;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-
-        .status-info {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 8px;
-            padding: 12px;
-            margin-top: 8px;
-            font-size: 14px;
-            color: #a0a0a0;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .point-indicator {
             position: absolute;
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            border: 2px solid white;
+            top: 50%; left: 50%;
             transform: translate(-50%, -50%);
-            pointer-events: none;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+            background: rgba(0,0,0,0.85);
+            padding: 25px;
+            border-radius: 12px;
+            display: none;
+            z-index: 100;
+            text-align: center;
+            border: 1px solid #333;
         }
-
-        .point-indicator.positive {
-            background: #4ade80;
+        .spinner {
+            width: 30px; height: 30px;
+            border: 3px solid #333;
+            border-top: 3px solid #fff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
         }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
 
-        .point-indicator.negative {
-            background: #f87171;
+        /* Helpers */
+        .mode-selector { display: flex; gap: 10px; margin-bottom: 5px; }
+        .mode-btn { 
+            flex: 1; padding: 10px; border: 1px solid #444; 
+            background: transparent; color: #888; cursor: pointer; border-radius: 6px;
+            font-weight: bold;
         }
-
-        .place-indicator {
-            position: absolute;
-            border: 2px solid #fbbf24;
-            background: rgba(251, 191, 36, 0.2);
-            pointer-events: none;
-            box-sizing: border-box;
+        .mode-btn.active.positive { background: #10b981; color: white; border-color: #10b981; }
+        .mode-btn.active.negative { background: #ef4444; color: white; border-color: #ef4444; }
+        
+        .download-row { display: flex; gap: 8px; margin-top: 10px; border-top: 1px solid #333; padding-top: 15px; }
+        .download-btn { 
+            flex: 1; padding: 8px; background: #222; border: 1px solid #444; 
+            color: #aaa; cursor: pointer; border-radius: 6px; font-size: 12px;
         }
-
-        @media (max-width: 1024px) {
-            .main-container {
-                flex-direction: column;
-            }
-
-            .control-section {
-                width: 100%;
-            }
-
-            .canvas-section {
-                min-height: 400px;
-            }
-        }
+        .download-btn:hover { background: #333; color: white; }
+        .section-label { font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-top: 5px;}
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🎯 SAM3 Web GUI</h1>
+        <h1>🎯 SAM3 Robot Teleop</h1>
     </div>
 
     <div class="main-container">
-        <!-- Left: Canvas Section -->
         <div class="canvas-section">
             <div class="canvas-wrapper">
                 <canvas id="mainCanvas"></canvas>
             </div>
             <div class="loading" id="loading">
                 <div class="spinner"></div>
-                <p>Processing...</p>
+                <div id="loadingText">Processing...</div>
             </div>
         </div>
 
-        <!-- Right: Control Section -->
         <div class="control-section">
-            <!-- Step 1: Start Video -->
-            <button class="step-button step-1" id="btnStartVideo">
-                Step 1: Start Video
-            </button>
+            <button class="step-button step-1" id="btnStartVideo">1. Start Stream</button>
 
-            <!-- Step 2: Stop Video -->
-            <button class="step-button step-2" id="btnStopVideo" disabled>
-                Step 2: Stop Video
-            </button>
-            <div class="status-info" id="statusVideo" style="display: none;">
-                Video stopped. Frame captured.
-            </div>
+            <button class="step-button step-2" id="btnStopVideo" disabled>2. Stop & Capture</button>
 
-            <!-- Step 3: Add Points -->
-            <button class="step-button step-3" id="btnAddPoints" disabled>
-                Step 3: Add Points
-            </button>
+            <button class="step-button step-3" id="btnAddPoints" disabled>3. Annotate Points</button>
             <div class="mode-selector" id="modeSelector" style="display: none;">
-                <button class="mode-btn positive active" id="btnPositive">Positive</button>
-                <button class="mode-btn negative" id="btnNegative">Negative</button>
-            </div>
-            <div class="status-info" id="statusPoints" style="display: none;">
-                Points: <span id="pointCount">0</span>
+                <button class="mode-btn positive active" id="btnPositive">Positive (+)</button>
+                <button class="mode-btn negative" id="btnNegative">Negative (-)</button>
             </div>
 
-            <!-- Step 4: Generate Mask -->
-            <button class="step-button step-4" id="btnGenerateMask" disabled>
-                Step 4: Generate Mask
-            </button>
-            <div class="status-info" id="statusMask" style="display: none;">
-                Mask generated successfully.
-            </div>
+            <button class="step-button step-4" id="btnGenerateMask" disabled>4. Segment</button>
 
-            <!-- Step 5: Select Place Point -->
-            <button class="step-button step-5" id="btnSelectPlace" disabled>
-                Step 5: Select Place Point
-            </button>
-            <div class="status-info" id="statusPlace" style="display: none;">
-                Click on overlay to select 10x10 region.
-            </div>
+            <button class="step-button step-5" id="btnSelectPlace" disabled>5. Select Place</button>
 
-            <!-- Step 6: Download -->
-            <button class="step-button step-6" id="btnDownload" disabled>
-                Step 6: Download
-            </button>
-            <div class="download-options" id="downloadOptions" style="display: none;">
-                <button class="download-btn" id="btnDownloadOverlay">Download Overlay</button>
-                <button class="download-btn" id="btnDownloadMask">Download Mask</button>
-                <button class="download-btn" id="btnDownloadPlace" style="display: none;">Download Place Mask</button>
+            <button class="step-button step-6" id="btnExecuteGrasp" disabled>6. Execute Grasp</button>
+            
+            <div id="downloadOptions" style="display: none;">
+                <div class="section-label">Debug / Export</div>
+                <div class="download-row">
+                    <button class="download-btn" id="dlOverlay">Save Overlay</button>
+                    <button class="download-btn" id="dlMask">Save Mask</button>
+                </div>
             </div>
         </div>
     </div>
 
     <script>
-        // State management
+        // State
         const state = {
-            step: 0, // 0: initial, 1: video started, 2: video stopped, 3: points added, 4: mask generated, 5: place selected
-            videoRunning: false,
-            videoInterval: null,
-            currentImage: null,
-            currentOverlay: null,
-            currentMask: null,
-            placeMask: null,
+            step: 0,
+            pollingInterval: null,
+            canvasScale: 1,
             points: [],
             labels: [],
-            currentMode: 'positive', // 'positive' or 'negative'
-            selectedPlace: null,
-            imageSize: { width: 0, height: 0 },
-            canvasScale: 1
+            currentMode: 'positive',
+            currentImage: null, 
+            currentOverlay: null
         };
 
-        // DOM elements
-        const mainCanvas = document.getElementById('mainCanvas');
-        const ctx = mainCanvas.getContext('2d');
+        // Elements
+        const canvas = document.getElementById('mainCanvas');
+        const ctx = canvas.getContext('2d');
         const loading = document.getElementById('loading');
-
+        
         // Buttons
-        const btnStartVideo = document.getElementById('btnStartVideo');
-        const btnStopVideo = document.getElementById('btnStopVideo');
-        const btnAddPoints = document.getElementById('btnAddPoints');
-        const btnGenerateMask = document.getElementById('btnGenerateMask');
-        const btnSelectPlace = document.getElementById('btnSelectPlace');
-        const btnDownload = document.getElementById('btnDownload');
-        const btnPositive = document.getElementById('btnPositive');
-        const btnNegative = document.getElementById('btnNegative');
-        const btnDownloadOverlay = document.getElementById('btnDownloadOverlay');
-        const btnDownloadMask = document.getElementById('btnDownloadMask');
-        const btnDownloadPlace = document.getElementById('btnDownloadPlace');
+        const btns = {
+            start: document.getElementById('btnStartVideo'),
+            stop: document.getElementById('btnStopVideo'),
+            points: document.getElementById('btnAddPoints'),
+            mask: document.getElementById('btnGenerateMask'),
+            place: document.getElementById('btnSelectPlace'),
+            execute: document.getElementById('btnExecuteGrasp'), // Changed from Download
+            pos: document.getElementById('btnPositive'),
+            neg: document.getElementById('btnNegative')
+        };
 
-        // Status elements
-        const statusVideo = document.getElementById('statusVideo');
-        const statusPoints = document.getElementById('statusPoints');
-        const statusMask = document.getElementById('statusMask');
-        const statusPlace = document.getElementById('statusPlace');
-        const pointCount = document.getElementById('pointCount');
-        const modeSelector = document.getElementById('modeSelector');
-        const downloadOptions = document.getElementById('downloadOptions');
+        // Init Canvas
+        canvas.width = 640;
+        canvas.height = 480;
+        ctx.fillStyle = "#111";
+        ctx.fillRect(0,0,640,480);
+        ctx.fillStyle = "#555";
+        ctx.font = "20px Arial";
+        ctx.textAlign = "center";
+        ctx.fillText("Ready", 320, 240);
 
-        // Initialize canvas
-        function initCanvas() {
-            mainCanvas.width = 800;
-            mainCanvas.height = 600;
-            ctx.fillStyle = '#000';
-            ctx.fillRect(0, 0, mainCanvas.width, mainCanvas.height);
-            ctx.fillStyle = '#666';
-            ctx.font = '24px Arial';
-            ctx.textAlign = 'center';
-            ctx.fillText('Click "Step 1: Start Video" to begin', mainCanvas.width / 2, mainCanvas.height / 2);
-        }
-
-        // Update button states based on current step
-        function updateButtonStates() {
-            btnStartVideo.disabled = state.step >= 1;
-            btnStopVideo.disabled = state.step < 1;
-            btnAddPoints.disabled = state.step < 2;
-            btnGenerateMask.disabled = state.step < 3 || state.points.length === 0;
-            btnSelectPlace.disabled = state.step < 4;
-            btnDownload.disabled = state.step < 4;
-        }
-
-        // Step 1: Start Video
-        btnStartVideo.addEventListener('click', async () => {
-            state.videoRunning = true;
-            state.step = 1;
-            updateButtonStates();
-            loading.style.display = 'block';
-
-            // Start video stream
-            const startVideo = async () => {
-                try {
-                    const response = await fetch('/start_video', { method: 'POST' });
-                    const data = await response.json();
-                    
-                    if (data.success) {
-                        const img = new Image();
-                        img.onload = () => {
-                            // Calculate scale to fit canvas
-                            const maxWidth = 800;
-                            const maxHeight = 600;
-                            const scaleX = maxWidth / img.width;
-                            const scaleY = maxHeight / img.height;
-                            state.canvasScale = Math.min(scaleX, scaleY, 1);
-                            
-                            mainCanvas.width = img.width * state.canvasScale;
-                            mainCanvas.height = img.height * state.canvasScale;
-                            
-                            ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
-                            loading.style.display = 'none';
-                        };
-                        img.src = data.frame_data;
-                    }
-                } catch (error) {
-                    console.error('Error starting video:', error);
-                    loading.style.display = 'none';
-                }
-            };
-
-            await startVideo();
-
-            // Continue fetching frames
-            state.videoInterval = setInterval(async () => {
-                if (!state.videoRunning) {
-                    clearInterval(state.videoInterval);
-                    state.videoInterval = null;
-                    return;
-                }
-                try {
-                    const response = await fetch('/start_video', { method: 'POST' });
-                    const data = await response.json();
-                    if (data.success) {
-                        const img = new Image();
-                        img.onload = () => {
-                            if (state.videoRunning) {
-                                ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
-                            }
-                        };
-                        img.src = data.frame_data;
-                    }
-                } catch (error) {
-                    console.error('Error fetching frame:', error);
-                }
-            }, 100); // Update every 100ms
-        });
-
-        // Step 2: Stop Video
-        btnStopVideo.addEventListener('click', async () => {
-            state.videoRunning = false;
-            if (state.videoInterval) {
-                clearInterval(state.videoInterval);
-                state.videoInterval = null;
-            }
-
-            loading.style.display = 'block';
-
-            // Capture current frame from canvas
-            const canvasData = mainCanvas.toDataURL('image/jpeg');
-
+        // --- Step 1: Start Video (Polling Logic) ---
+        btns.start.addEventListener('click', async () => {
+            setLoading(true, "Starting Stream...");
             try {
-                const response = await fetch('/stop_video', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ frame_data: canvasData })
-                });
-
-                const data = await response.json();
+                const res = await fetch('/start_video', { method: 'POST' });
+                const data = await res.json();
+                
                 if (data.success) {
-                    state.currentImage = data.image_data;
-                    state.imageSize = data.image_size;
-                    state.step = 2;
-                    updateButtonStates();
-                    statusVideo.style.display = 'block';
-                    loading.style.display = 'none';
-
-                    // Display captured image
-                    const img = new Image();
-                    img.onload = () => {
-                        // Recalculate scale if needed
-                        const maxWidth = 800;
-                        const maxHeight = 600;
-                        const scaleX = maxWidth / img.width;
-                        const scaleY = maxHeight / img.height;
-                        state.canvasScale = Math.min(scaleX, scaleY, 1);
-                        
-                        mainCanvas.width = img.width * state.canvasScale;
-                        mainCanvas.height = img.height * state.canvasScale;
-                        ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
-                    };
-                    img.src = data.image_data;
-                } else {
-                    alert('Error: ' + (data.error || 'Failed to stop video'));
-                    loading.style.display = 'none';
-                }
-            } catch (error) {
-                console.error('Error stopping video:', error);
-                alert('Failed to stop video: ' + error.message);
-                loading.style.display = 'none';
-            }
-        });
-
-        // Step 3: Add Points
-        btnAddPoints.addEventListener('click', () => {
-            modeSelector.style.display = 'flex';
-            statusPoints.style.display = 'block';
-            state.step = 3;
-            updateButtonStates();
-        });
-
-        // Mode selection
-        btnPositive.addEventListener('click', () => {
-            state.currentMode = 'positive';
-            btnPositive.classList.add('active');
-            btnNegative.classList.remove('active');
-        });
-
-        btnNegative.addEventListener('click', () => {
-            state.currentMode = 'negative';
-            btnNegative.classList.add('active');
-            btnPositive.classList.remove('active');
-        });
-
-        // Canvas click for points
-        mainCanvas.addEventListener('click', (e) => {
-            if (state.step < 3) return;
-
-            const rect = mainCanvas.getBoundingClientRect();
-            const x = (e.clientX - rect.left) / state.canvasScale;
-            const y = (e.clientY - rect.top) / state.canvasScale;
-
-            // Check if clicking on existing point
-            const pointIndex = findPointAt(x, y);
-            if (pointIndex !== -1) {
-                // Remove point
-                state.points.splice(pointIndex, 1);
-                state.labels.splice(pointIndex, 1);
-            } else {
-                // Add point
-                state.points.push([x, y]);
-                state.labels.push(state.currentMode === 'positive' ? 1 : 0);
-            }
-
-            updatePointDisplay();
-            updateButtonStates();
-        });
-
-        function findPointAt(x, y) {
-            const threshold = 15;
-            for (let i = 0; i < state.points.length; i++) {
-                const dx = state.points[i][0] - x;
-                const dy = state.points[i][1] - y;
-                if (Math.sqrt(dx * dx + dy * dy) < threshold) {
-                    return i;
-                }
-            }
-            return -1;
-        }
-
-        function updatePointDisplay() {
-            // Redraw canvas
-            if (state.currentImage) {
-                const img = new Image();
-                img.onload = () => {
-                    ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
+                    state.step = 1;
+                    updateUI();
                     
-                    // Draw points
-                    state.points.forEach((point, i) => {
-                        const x = point[0] * state.canvasScale;
-                        const y = point[1] * state.canvasScale;
-                        const label = state.labels[i];
-                        
-                        ctx.beginPath();
-                        ctx.arc(x, y, 8, 0, 2 * Math.PI);
-                        ctx.fillStyle = label === 1 ? '#4ade80' : '#f87171';
-                        ctx.fill();
-                        ctx.strokeStyle = 'white';
-                        ctx.lineWidth = 2;
-                        ctx.stroke();
-                    });
-                };
-                img.src = state.currentImage;
+                    if (state.pollingInterval) clearInterval(state.pollingInterval);
+                    
+                    state.pollingInterval = setInterval(async () => {
+                        try {
+                            const frameRes = await fetch('/get_frame');
+                            const frameData = await frameRes.json();
+                            
+                            if (frameData.success && frameData.frame_data) {
+                                renderImage(frameData.frame_data);
+                            }
+                        } catch (e) {
+                            console.error("Polling error", e);
+                        }
+                    }, 40); 
+                }
+            } catch (e) {
+                alert("Failed to start stream");
+            } finally {
+                setLoading(false);
             }
+        });
 
-            pointCount.textContent = state.points.length;
-        }
+        // --- Step 2: Stop Video (Capture & Upload) ---
+        btns.stop.addEventListener('click', async () => {
+            if (state.pollingInterval) clearInterval(state.pollingInterval);
+            state.pollingInterval = null;
 
-        // Step 4: Generate Mask
-        btnGenerateMask.addEventListener('click', async () => {
-            if (state.points.length === 0) {
-                alert('Please add at least one point first.');
-                return;
-            }
-
-            loading.style.display = 'block';
+            setLoading(true, "Capturing & Loading Model...");
 
             try {
-                const response = await fetch('/predict_mask', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        points: state.points,
-                        labels: state.labels
-                    })
+                await fetch('/stop_video', { method: 'POST' });
+
+                canvas.toBlob(async (blob) => {
+                    if (!blob) {
+                        alert("Canvas empty!"); 
+                        setLoading(false); 
+                        return;
+                    }
+
+                    const formData = new FormData();
+                    formData.append('image', blob, 'capture.jpg');
+
+                    const upRes = await fetch('/upload', { method: 'POST', body: formData });
+                    const upData = await upRes.json();
+
+                    if (upData.success) {
+                        state.currentImage = upData.image_data;
+                        renderImage(state.currentImage);
+                        state.step = 2;
+                        updateUI();
+                    } else {
+                        alert("Capture failed: " + upData.error);
+                    }
+                    setLoading(false);
+                }, 'image/jpeg', 0.95);
+
+            } catch (e) {
+                console.error(e);
+                alert("Error stopping stream");
+                setLoading(false);
+            }
+        });
+
+        // --- Step 3: Points ---
+        btns.points.addEventListener('click', () => {
+            state.step = 3;
+            document.getElementById('modeSelector').style.display = 'flex';
+            updateUI();
+        });
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (state.step < 3) return;
+            
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+
+            const x = (e.clientX - rect.left) * scaleX;
+            const y = (e.clientY - rect.top) * scaleY;
+
+            // Step 3: Add Annotation Points
+            if (state.step === 3) {
+                const clickedIndex = state.points.findIndex(p => {
+                    const dx = p[0] - x;
+                    const dy = p[1] - y;
+                    return Math.sqrt(dx*dx + dy*dy) < 15;
                 });
 
-                const data = await response.json();
+                if (clickedIndex >= 0) {
+                    state.points.splice(clickedIndex, 1);
+                    state.labels.splice(clickedIndex, 1);
+                } else {
+                    state.points.push([x, y]);
+                    state.labels.push(state.currentMode === 'positive' ? 1 : 0);
+                }
+                redrawCanvas();
+            }
+
+            // Step 5: Select Place Region
+            if (state.step === 5) {
+                handlePlaceSelection(x, y);
+            }
+        });
+
+        // --- Step 4: Generate Mask ---
+        btns.mask.addEventListener('click', async () => {
+            if (state.points.length === 0) return alert("Add points first!");
+            setLoading(true, "Segmenting...");
+            
+            try {
+                const res = await fetch('/predict_mask', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ points: state.points, labels: state.labels })
+                });
+                const data = await res.json();
+                
                 if (data.success) {
                     state.currentOverlay = data.overlay_data;
-                    state.currentMask = data.mask_data;
+                    renderImage(data.overlay_data);
                     state.step = 4;
-                    updateButtonStates();
-                    statusMask.style.display = 'block';
-                    downloadOptions.style.display = 'flex';
-
-                    // Display overlay
-                    const img = new Image();
-                    img.onload = () => {
-                        ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
-                    };
-                    img.src = data.overlay_data;
+                    updateUI();
                 } else {
-                    alert('Error: ' + data.error);
+                    alert("Error: " + data.error);
                 }
-            } catch (error) {
-                console.error('Error generating mask:', error);
-                alert('Failed to generate mask: ' + error.message);
+            } catch (e) {
+                alert("Segmentation failed");
             } finally {
-                loading.style.display = 'none';
+                setLoading(false);
             }
         });
 
-        // Step 5: Select Place Point
-        btnSelectPlace.addEventListener('click', () => {
-            statusPlace.style.display = 'block';
+        // --- Step 5: Place Selection ---
+        btns.place.addEventListener('click', () => {
             state.step = 5;
-            updateButtonStates();
+            updateUI();
         });
 
-        // Canvas click for place point (on overlay)
-        mainCanvas.addEventListener('click', async (e) => {
-            if (state.step !== 5 || !state.currentOverlay) return;
+        async function handlePlaceSelection(x, y) {
+            setLoading(true, "Recording Place Location...");
+            try {
+                const res = await fetch('/select_place', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ x: x, y: y })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    redrawCanvas();
+                    ctx.strokeStyle = "yellow";
+                    ctx.lineWidth = 3;
+                    ctx.strokeRect(x - 5, y - 5, 10, 10);
+                    state.step = 6; 
+                    updateUI();
+                }
+            } catch(e) {
+                console.error(e);
+            } finally {
+                setLoading(false);
+            }
+        }
 
-            const rect = mainCanvas.getBoundingClientRect();
-            const clickX = (e.clientX - rect.left) / state.canvasScale;
-            const clickY = (e.clientY - rect.top) / state.canvasScale;
+        // --- Step 6: Execute Grasp (Changed from Download) ---
+        btns.execute.addEventListener('click', async () => {
+            // Note: We show a specific message because backend waits for PC
+            setLoading(true, "Syncing with Env & Sending Action...");
+            
+            try {
+                const res = await fetch('/execute_grasp', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'}
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    alert(`✅ Command Sent!\nAction ID: ${data.action_id}`);
+                } else {
+                    alert(`❌ Failed: ${data.error}`);
+                }
+            } catch (e) {
+                alert("Network Error during execution request.");
+            } finally {
+                setLoading(false);
+            }
+        });
 
-            // Calculate 10x10 region (centered on click)
-            const regionX = Math.max(0, Math.min(Math.floor(clickX - 5), state.imageSize.width - 10));
-            const regionY = Math.max(0, Math.min(Math.floor(clickY - 5), state.imageSize.height - 10));
 
-            // Toggle selection
-            if (state.selectedPlace && state.selectedPlace.x === regionX && state.selectedPlace.y === regionY) {
-                state.selectedPlace = null;
+        // --- Helpers ---
+
+        function renderImage(base64Str) {
+            const img = new Image();
+            img.onload = () => {
+                if (canvas.width !== img.width || canvas.height !== img.height) {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                }
+                ctx.drawImage(img, 0, 0);
+                if (state.step >= 3) drawPoints();
+            };
+            img.src = base64Str;
+        }
+
+        function redrawCanvas() {
+            const src = (state.step >= 4 && state.currentOverlay) ? state.currentOverlay : state.currentImage;
+            if (src) renderImage(src);
+        }
+
+        function drawPoints() {
+            state.points.forEach((p, i) => {
+                ctx.beginPath();
+                ctx.arc(p[0], p[1], 5, 0, Math.PI * 2);
+                ctx.fillStyle = state.labels[i] === 1 ? '#10b981' : '#ef4444'; 
+                ctx.fill();
+                ctx.strokeStyle = 'white';
+                ctx.stroke();
+            });
+        }
+
+        function updateUI() {
+            Object.values(btns).forEach(b => b.disabled = true);
+            
+            if (state.step === 0 || state.step >= 2) btns.start.disabled = false;
+            if (state.step === 1) btns.stop.disabled = false;
+            if (state.step >= 2) btns.points.disabled = false;
+            if (state.step >= 3 && state.points.length > 0) btns.mask.disabled = false;
+            if (state.step >= 4) btns.place.disabled = false;
+            if (state.step >= 4) btns.execute.disabled = false; // Enable action after mask/place
+
+            btns.pos.disabled = false;
+            btns.neg.disabled = false;
+
+            // Show Debug options only after mask is generated
+            const dlRow = document.getElementById('downloadOptions');
+            dlRow.style.display = (state.step >= 4) ? 'block' : 'none';
+        }
+
+        function setLoading(isActive, text="Processing...") {
+            loading.style.display = isActive ? 'block' : 'none';
+            document.getElementById('loadingText').innerText = text;
+        }
+
+        // Mode Toggles
+        btns.pos.onclick = () => {
+            state.currentMode = 'positive';
+            btns.pos.classList.add('active');
+            btns.neg.classList.remove('active');
+        };
+        btns.neg.onclick = () => {
+            state.currentMode = 'negative';
+            btns.neg.classList.add('active');
+            btns.pos.classList.remove('active');
+        };
+
+        // Legacy Downloads
+        document.getElementById('dlOverlay').onclick = () => download('overlay');
+        document.getElementById('dlMask').onclick = () => download('mask');
+
+        async function download(type) {
+            const res = await fetch('/download', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ type })
+            });
+            if (res.ok) {
+                const blob = await res.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = type + '.png';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
             } else {
-                state.selectedPlace = { x: regionX, y: regionY };
+                alert("Download failed");
             }
+        }
 
-            // Update display
-            if (state.currentOverlay) {
-                const img = new Image();
-                img.onload = () => {
-                    ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
-                    
-                    // Draw place indicator
-                    if (state.selectedPlace) {
-                        const x = state.selectedPlace.x * state.canvasScale;
-                        const y = state.selectedPlace.y * state.canvasScale;
-                        const size = 10 * state.canvasScale;
-                        
-                        ctx.strokeStyle = '#fbbf24';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(x, y, size, size);
-                        ctx.fillStyle = 'rgba(251, 191, 36, 0.2)';
-                        ctx.fillRect(x, y, size, size);
-                    }
-                };
-                img.src = state.currentOverlay;
-            }
-
-            // Send to backend
-            if (state.selectedPlace) {
-                try {
-                    const response = await fetch('/select_place', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            x: state.selectedPlace.x,
-                            y: state.selectedPlace.y
-                        })
-                    });
-
-                    const data = await response.json();
-                    if (data.success) {
-                        state.placeMask = data.mask_data;
-                        btnDownloadPlace.style.display = 'block';
-                    }
-                } catch (error) {
-                    console.error('Error selecting place:', error);
-                }
-            } else {
-                btnDownloadPlace.style.display = 'none';
-            }
-        });
-
-        // Step 6: Download
-        btnDownload.addEventListener('click', () => {
-            // Download options are already visible
-        });
-
-        // Download buttons
-        btnDownloadOverlay.addEventListener('click', async () => {
-            try {
-                const response = await fetch('/download', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ type: 'overlay' })
-                });
-
-                if (response.ok) {
-                    const blob = await response.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'overlay_output.png';
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                }
-            } catch (error) {
-                console.error('Error downloading overlay:', error);
-            }
-        });
-
-        btnDownloadMask.addEventListener('click', async () => {
-            try {
-                const response = await fetch('/download', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ type: 'mask' })
-                });
-
-                if (response.ok) {
-                    const blob = await response.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'mask_output.png';
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                }
-            } catch (error) {
-                console.error('Error downloading mask:', error);
-            }
-        });
-
-        btnDownloadPlace.addEventListener('click', async () => {
-            try {
-                const response = await fetch('/download', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ type: 'place_mask' })
-                });
-
-                if (response.ok) {
-                    const blob = await response.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = 'place_mask.png';
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                }
-            } catch (error) {
-                console.error('Error downloading place mask:', error);
-            }
-        });
-
-        // Initialize
-        initCanvas();
-        updateButtonStates();
+        updateUI();
     </script>
 </body>
 </html>

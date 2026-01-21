@@ -1,638 +1,521 @@
 import os
-import base64
 import io
-import signal
 import sys
 import gc
+import uuid
+import time
+import signal
+import base64
+import logging
+import threading
 import numpy as np
+import cv2
 import torch
-from PIL import Image
-import matplotlib.pyplot as plt
-from flask import Flask, render_template, request, jsonify, send_file
-import sam3
+import zenoh
+from functools import partial
+from PIL import Image, ImageDraw
+from flask import Flask, request, jsonify, send_file, render_template
+
+# --- SAM3 Imports ---
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'static/uploads'
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+# --- Protobuf Imports (Mocked for this context) ---
+# In production, ensure these are compiled from your .proto files
+try:
+    from generated.image_pb2 import ImageData
+    from generated.action_pb2 import GraspGoal
+    from generated.types_pb2 import Pose, Vector3, Quaternion
+except ImportError:
+    print("Warning: Generated protos not found. Creating Mocks.")
+    class MockProto:
+        def SerializeToString(self): return b'mock_bytes'
+        def ParseFromString(self, data): pass
+        def __init__(self, **kwargs): 
+            for k,v in kwargs.items(): setattr(self, k, v)
+    
+    class ImageData(MockProto):
+        class Timestamp:
+            def GetCurrentTime(self): pass
+        def __init__(self): self.timestamp = self.Timestamp()
+    
+    class GraspGoal(MockProto): pass
+    class Pose(MockProto): pass
 
-# Ensure upload folder exists
+# --- Configuration ---
+CONFIG = {
+    'UPLOAD_FOLDER': 'static/uploads',
+    'CHECKPOINT_PATH': "compute/third_party/sam3/ckp/sam3.pt",
+    'MAX_IMAGE_SIZE': 1024,
+    'DEVICE': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
+    'DTYPE': torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32,
+    
+    # Zenoh Configuration
+    'CAMERA_ID': "SN_57524755", 
+    'ZENOH_ROUTER': "tcp/10.42.0.220:7447#so_sndbuf=52428800",
+    
+    # Action Topics
+    'ACTION_GRASP_GOAL': "arm/action/grasp/goal"
+}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Helper Classes ---
+class ImageProcessor:
+    @staticmethod
+    def resize_if_needed(image: Image.Image, max_size: int) -> Image.Image:
+        w, h = image.size
+        if max(w, h) > max_size:
+            scale = max_size / max(w, h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        return image
+
+    @staticmethod
+    def to_base64(image: Image.Image, fmt: str = "JPEG", quality: int = 85) -> str:
+        buf = io.BytesIO()
+        image.save(buf, format=fmt, quality=quality, optimize=True)
+        img_str = base64.b64encode(buf.getvalue()).decode('utf-8')
+        mime = "jpeg" if fmt.upper() in ["JPG", "JPEG"] else "png"
+        return f"data:image/{mime};base64,{img_str}"
+
+    @staticmethod
+    def from_base64(base64_str: str) -> Image.Image:
+        if ',' in base64_str:
+            base64_str = base64_str.split(',')[1]
+        return Image.open(io.BytesIO(base64.b64decode(base64_str))).convert("RGB")
+
+    @staticmethod
+    def create_overlay(image: Image.Image, mask_array: np.ndarray, points=None, labels=None) -> Image.Image:
+        mask_uint8 = (mask_array > 0).astype(np.uint8) * 255
+        overlay_rgba = Image.new("RGBA", image.size, (30, 144, 255, 0))
+        overlay_np = np.array(overlay_rgba)
+        
+        if mask_uint8.shape != (image.height, image.width):
+             mask_img = Image.fromarray(mask_uint8).resize(image.size, Image.Resampling.NEAREST)
+             mask_uint8 = np.array(mask_img)
+
+        overlay_np[..., 3] = np.where(mask_uint8 > 0, 150, 0).astype(np.uint8)
+        overlay_layer = Image.fromarray(overlay_np, "RGBA")
+        result = Image.alpha_composite(image.convert("RGBA"), overlay_layer).convert("RGB")
+
+        if points is not None and len(points) > 0:
+            draw = ImageDraw.Draw(result)
+            r = 5
+            for point, label in zip(points, labels):
+                x, y = point
+                color = "green" if label == 1 else "red"
+                draw.ellipse((x-r, y-r, x+r, y+r), fill=color, outline="white", width=2)
+        return result
+
+class ImageDecoders:
+    @staticmethod
+    def decode_rgb(msg: ImageData) -> np.ndarray:
+        try:
+            np_arr = np.frombuffer(msg.data, dtype=np.uint8)
+            frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame_bgr is not None:
+                return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        except Exception:
+            pass
+        return None
+
+# --- Zenoh Logic ---
+
+class ZenohStreamer:
+    def __init__(self):
+        self.session = None
+        self.subscriber_rgb = None
+        self.subscriber_pc = None  # New: Listen for Point Cloud
+        self.publisher_mask = None
+        self.publisher_action = None # New: Publish Action
+        
+        self._latest_image = None
+        self._latest_mask_pc = None # Stores the incoming point cloud
+        self._mask_pc_timestamp = 0
+        
+        self._lock = threading.Lock()
+        self._is_streaming = False
+        self._init_session()
+
+    def _init_session(self):
+        try:
+            conf = zenoh.Config()
+            conf.insert_json5("scouting/multicast/enabled", "true")
+            conf.insert_json5("transport/shared_memory/enabled", "false")
+            if CONFIG['ZENOH_ROUTER']:
+                conf.insert_json5("connect/endpoints", f"['{CONFIG['ZENOH_ROUTER']}']")
+            logger.info("Initializing Zenoh Session...")
+            self.session = zenoh.open(conf)
+        except Exception as e:
+            logger.error(f"Failed to initialize Zenoh session: {e}")
+
+    def start_stream(self):
+        with self._lock:
+            if self._is_streaming: return True
+            if not self.session: self._init_session()
+
+            camera_id = CONFIG['CAMERA_ID']
+            
+            # --- FIX: Construct Topics correctly from CAMERA_ID ---
+            rgb_topic = f"env/{camera_id}/rgb"
+            mask_topic = f"env/{camera_id}/mask"
+            pc_topic = f"env/{camera_id}/mask_pc"
+            # -----------------------------------------------------
+
+            logger.info(f"Subscribing to RGB: {rgb_topic}")
+            logger.info(f"Subscribing to PC: {pc_topic}")
+            logger.info(f"Publisher Mask: {mask_topic}")
+            logger.info(f"Publisher Action: {CONFIG['ACTION_GRASP_GOAL']}")
+
+            try:
+                # 1. RGB Sub
+                self.subscriber_rgb = self.session.declare_subscriber(
+                    rgb_topic, self._on_image_update
+                )
+                
+                # 2. Mask PC Sub (Wait for env to process mask)
+                self.subscriber_pc = self.session.declare_subscriber(
+                    pc_topic, self._on_pc_update
+                )
+
+                # 3. Publishers
+                self.publisher_mask = self.session.declare_publisher(mask_topic)
+                self.publisher_action = self.session.declare_publisher(CONFIG['ACTION_GRASP_GOAL'])
+
+                self._is_streaming = True
+                return True
+            except Exception as e:
+                logger.error(f"Failed to start stream: {e}")
+                return False
+
+    def stop_stream(self):
+        with self._lock:
+            if not self._is_streaming: return
+            if self.subscriber_rgb:
+                self.subscriber_rgb.undeclare()
+                self.subscriber_rgb = None
+            if self.subscriber_pc:
+                self.subscriber_pc.undeclare()
+                self.subscriber_pc = None
+            if self.publisher_mask:
+                self.publisher_mask.undeclare()
+                self.publisher_mask = None
+            if self.publisher_action:
+                self.publisher_action.undeclare()
+                self.publisher_action = None
+
+            self._latest_image = None
+            self._is_streaming = False
+
+    # --- Callbacks ---
+
+    def _on_image_update(self, sample):
+        try:
+            msg = ImageData()
+            msg.ParseFromString(bytes(sample.payload))
+            if getattr(msg, 'format', '') in ["jpeg", "jpg", "png"]:
+                np_img = ImageDecoders.decode_rgb(msg)
+                if np_img is not None:
+                    pil_img = Image.fromarray(np_img)
+                    with self._lock:
+                        self._latest_image = pil_img
+        except Exception:
+            pass
+
+    def _on_pc_update(self, sample):
+        """Called when env returns the processed point cloud from the mask."""
+        with self._lock:
+            # We store the raw bytes because we just pass them to the Action
+            self._latest_mask_pc = sample.payload
+            self._mask_pc_timestamp = time.time()
+            logger.info(f"Received Mask PC update. Bytes: {len(self._latest_mask_pc)}")
+
+    # --- Actions ---
+
+    def publish_mask(self, mask_arr: np.ndarray):
+        """Publishes mask to env, which should trigger a PC calculation."""
+        if not self.publisher_mask and self.session:
+             self.start_stream() # Ensure pubs exist
+
+        if not self.publisher_mask:
+            logger.error("Cannot publish mask: Publisher not active.")
+            return
+
+        try:
+            success, encoded_mask = cv2.imencode(".png", mask_arr)
+            if success:
+                out = ImageData()
+                if hasattr(out, 'timestamp'):
+                    try: out.timestamp.GetCurrentTime()
+                    except: pass
+                
+                out.height = mask_arr.shape[0]
+                out.width = mask_arr.shape[1]
+                out.channels = 1
+                out.format = "png"
+                out.data = encoded_mask.tobytes()
+                
+                # Clear previous PC so we know when the new one arrives
+                with self._lock:
+                    self._latest_mask_pc = None 
+                
+                self.publisher_mask.put(out.SerializeToString())
+                logger.info(f"Mask published to Zenoh.")
+        except Exception as e:
+            logger.error(f"Failed to publish mask: {e}")
+
+    def wait_and_publish_action(self, timeout=5.0):
+        """Waits for mask_pc to arrive, then sends GraspGoal."""
+        start_time = time.time()
+        logger.info("Waiting for Mask Point Cloud from Environment...")
+        
+        pc_data = None
+        while time.time() - start_time < timeout:
+            with self._lock:
+                if self._latest_mask_pc is not None:
+                    pc_data = self._latest_mask_pc
+                    break
+            time.sleep(0.1)
+        
+        if pc_data is None:
+            logger.error("Timeout: Mask PC was not received from environment.")
+            return False, "Timeout waiting for Mask PC"
+
+        # Construct Action Goal
+        try:
+            action_id = str(uuid.uuid4())
+            goal = GraspGoal()
+            goal.action_id = action_id
+            goal.mask_pc = bytes(pc_data) # The raw PC bytes
+            goal.initial_approach_pose.position.x = 0.3
+            goal.initial_approach_pose.position.y = 0.0
+            goal.initial_approach_pose.position.z = 0.28
+
+            # Orientation: quat(xyzw) = 0, 0, 0.229, 0.973
+            # (Assuming missing x/y were 0 based on unit quaternion calculation)
+            goal.initial_approach_pose.quaternion.x = 0.0
+            goal.initial_approach_pose.quaternion.y = 0.229
+            goal.initial_approach_pose.quaternion.z = 0
+            goal.initial_approach_pose.quaternion.w = 0.973
+
+            goal.retract_pose.CopyFrom(goal.initial_approach_pose)
+            # Optional: Set defaults for other fields if needed
+            # goal.approach_distance = 0.1
+            # goal.lift_distance = 0.1
+
+            if not self.publisher_action:
+                 self.start_stream()
+
+            self.publisher_action.put(goal.SerializeToString())
+            logger.info(f"GraspAction Sent! ID: {action_id}")
+            return True, action_id
+        except Exception as e:
+            import traceback
+            logger.error(f"Failed to create/send action: {e} {traceback.format_exc()}")
+            return False, str(e)
+
+    # --- Getters ---
+    def get_latest_frame(self):
+        with self._lock:
+            return self._latest_image.copy() if self._latest_image else None
+    
+    def is_active(self): return self._is_streaming
+    def close(self):
+        self.stop_stream()
+        if self.session: self.session.close()
+
+# --- SAM3 & Session Logic ---
+
+class SAM3ModelHandler:
+    def __init__(self):
+        self.device = CONFIG['DEVICE']
+        self.model = None
+        self.processor = None
+
+    def _ensure_model_loaded(self):
+        if self.model is not None: return
+        logger.info(f"Lazy Loading SAM3 on {self.device}...")
+        if not os.path.exists(CONFIG['CHECKPOINT_PATH']):
+            raise FileNotFoundError(f"Checkpoint not found at {CONFIG['CHECKPOINT_PATH']}")
+        try:
+            self.model = build_sam3_image_model(
+                checkpoint_path=CONFIG['CHECKPOINT_PATH'], 
+                device=self.device,
+                enable_inst_interactivity=True
+            )
+            self.model.eval()
+            self.processor = Sam3Processor(self.model)
+        except Exception as e:
+            logger.error(f"Failed to load SAM3 model: {e}")
+            raise e
+
+    def get_inference_state(self, image: Image.Image):
+        self._ensure_model_loaded()
+        if self.device == 'cuda': torch.cuda.empty_cache()
+        return self.processor.set_image(image)
+
+    @torch.inference_mode()
+    def predict(self, inference_state, points, labels):
+        self._ensure_model_loaded()
+        masks, scores, logits = self.model.predict_inst(
+            inference_state,
+            point_coords=points,
+            point_labels=labels,
+            multimask_output=False
+        )
+        return self._to_numpy(masks), self._to_numpy(scores)
+
+    def _to_numpy(self, tensor):
+        if torch.is_tensor(tensor):
+            return tensor.float().cpu().numpy()
+        if isinstance(tensor, list):
+            return [t.float().cpu().numpy() if torch.is_tensor(t) else t for t in tensor]
+        return tensor
+
+    def cleanup(self):
+        self.model = None
+        self.processor = None
+        gc.collect()
+        if self.device == 'cuda': torch.cuda.empty_cache()
+
+class SessionManager:
+    def __init__(self):
+        self.current_image = None
+        self.inference_state = None
+        self.current_mask = None
+        self.current_overlay = None
+    
+    def set_image(self, image: Image.Image, inference_state):
+        self.release_inference()
+        self.current_image = image
+        self.inference_state = inference_state
+        self.current_mask = None
+        self.current_overlay = None
+
+    def release_inference(self):
+        if self.inference_state and hasattr(self.inference_state, 'clear'):
+            try: self.inference_state.clear()
+            except: pass
+        self.inference_state = None
+
+# --- Flask App ---
+app = Flask(__name__)
+app.config.update(CONFIG)
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Global variables for model and current session
-model = None
-processor = None
-device = None
-current_image = None
-current_inference_state = None
-video_running = False
-current_mask = None
-current_overlay = None
-place_mask = None
+model_handler = SAM3ModelHandler()
+session_manager = SessionManager()
+zenoh_streamer = ZenohStreamer()
 
-# -------------------------------
-# Device setup
-# -------------------------------
-def setup_device():
-    global device
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"Using device: {device}")
-
-# -------------------------------
-# Model setup
-# -------------------------------
-def setup_model():
-    global model, processor
-    print("Loading SAM3 model...")
-    CHECKPOINT = "/home/xuran-yao/code/DISCOVERSE_v2_exp/sam3/checkpoints/sam3.pt"
-    model = build_sam3_image_model(bpe_path=None,checkpoint_path=CHECKPOINT, enable_inst_interactivity=True)
-    model.to(device)
-    model.eval()
-    processor = Sam3Processor(model)
-    print("Model loaded successfully!")
-
-def cleanup_resources():
-    """Release GPU memory and other resources"""
-    global model, processor, current_inference_state, current_image, device
-    print("\nCleaning up resources...")
-    
-    # Clear inference state
-    if current_inference_state is not None:
-        # Try to clear any CUDA tensors in inference state
-        try:
-            if hasattr(current_inference_state, 'clear'):
-                current_inference_state.clear()
-        except:
-            pass
-        current_inference_state = None
-    
-    current_image = None
-    
-    # Move model to CPU and delete
-    if model is not None:
-        try:
-            # Move model to CPU first to release GPU memory
-            if torch.cuda.is_available() and next(model.parameters()).is_cuda:
-                model = model.cpu()
-                # Clear any remaining CUDA tensors
-                torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"Error moving model to CPU: {e}")
-        finally:
-            del model
-            model = None
-    
-    # Delete processor
-    if processor is not None:
-        del processor
-        processor = None
-    
-    # Force garbage collection multiple times to ensure cleanup
-    for _ in range(3):
-        gc.collect()
-    
-    # Clear CUDA cache multiple times
-    if torch.cuda.is_available():
-        for _ in range(3):
-            torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        torch.cuda.ipc_collect()
-        allocated = torch.cuda.memory_allocated() / 1024**2
-        reserved = torch.cuda.memory_reserved() / 1024**2
-        print(f"GPU memory cleared. Allocated: {allocated:.2f} MB, Reserved: {reserved:.2f} MB")
-    
-    print("Cleanup complete")
-    sys.exit(0)
-
-def signal_handler(sig, frame):
-    """Handle Ctrl+C signal"""
-    cleanup_resources()
-
-# -------------------------------
-# Helper functions
-# -------------------------------
-def convert_tensors_to_numpy(masks, scores, logits):
-    """Convert tensors to numpy arrays to release GPU memory"""
-    if torch.is_tensor(masks):
-        masks = masks.cpu().numpy()
-    elif isinstance(masks, (list, tuple)):
-        masks = [m.cpu().numpy() if torch.is_tensor(m) else m for m in masks]
-    
-    if torch.is_tensor(scores):
-        scores = scores.cpu().numpy()
-    
-    if torch.is_tensor(logits):
-        logits = logits.cpu().numpy()
-    
-    return masks, scores, logits
-
-def cleanup_tensors(*tensors):
-    """Delete tensors and clear CUDA cache"""
-    for tensor in tensors:
-        del tensor
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-def predict_mask_from_points(points_array, labels_array):
-    """Predict mask from points and labels, return numpy arrays"""
-    masks, scores, logits = model.predict_inst(
-        current_inference_state,
-        point_coords=points_array,
-        point_labels=labels_array,
-        multimask_output=False
-    )
-    return convert_tensors_to_numpy(masks, scores, logits)
-def show_mask(mask, ax, color=[30/255,144/255,255/255,0.6]):
-    h, w = mask.shape
-    mask_img = np.zeros((h, w, 4))
-    mask_img[..., :3] = color[:3]
-    mask_img[..., 3] = mask * color[3]
-    ax.imshow(mask_img)
-
-def show_points(coords, labels, ax):
-    pos = coords[labels==1]
-    neg = coords[labels==0]
-    ax.scatter(pos[:,0], pos[:,1], color='green', marker='*', s=200, edgecolor='white')
-    ax.scatter(neg[:,0], neg[:,1], color='red', marker='*', s=200, edgecolor='white')
-
-def create_mask_preview(image, masks, points=None, labels=None):
-    """Create a base64 encoded preview image with masks and points"""
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.imshow(image)
-
-    for mask in masks:
-        show_mask(mask, ax)
-
-    if points is not None and labels is not None:
-        show_points(points, labels, ax)
-
-    ax.axis('off')
-
-    # Save to bytes buffer
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-
-    # Encode to base64
-    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-    return f"data:image/png;base64,{img_base64}"
-
-# -------------------------------
-# Flask routes
-# -------------------------------
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/start_video', methods=['POST'])
 def start_video():
-    """Start video stream (snowflake video, can be replaced with camera)"""
-    global video_running
-    video_running = True
-    
-    # Generate a frame of snowflake-like video (random pixels with some structure)
-    width, height = 640, 480
-    # Create a dark background with random bright pixels (like snowflakes)
-    frame = np.random.randint(0, 50, (height, width, 3), dtype=np.uint8)
-    
-    # Add random bright pixels (snowflakes)
-    num_flakes = np.random.randint(100, 500)
-    for _ in range(num_flakes):
-        x = np.random.randint(0, width)
-        y = np.random.randint(0, height)
-        brightness = np.random.randint(200, 256)
-        frame[y, x] = [brightness, brightness, brightness]
-    
-    # Convert to base64
-    img = Image.fromarray(frame)
-    buffered = io.BytesIO()
-    img.save(buffered, format="JPEG", quality=85)
-    buffered.seek(0)
-    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    
-    return jsonify({
-        'success': True,
-        'frame_data': f"data:image/jpeg;base64,{img_base64}",
-        'width': width,
-        'height': height
-    })
+    success = zenoh_streamer.start_stream()
+    return jsonify({'success': success})
 
 @app.route('/stop_video', methods=['POST'])
 def stop_video():
-    """Stop video and save last frame as current_image for SAM3"""
-    global video_running, current_image, current_inference_state
-    
-    video_running = False
-    
-    # Get last frame from request (or generate one)
-    data = request.get_json() or {}
-    frame_data = data.get('frame_data')
-    
-    if frame_data:
-        # Decode base64 frame
-        if frame_data.startswith('data:image'):
-            frame_data = frame_data.split(',')[1]
-        frame_bytes = base64.b64decode(frame_data)
-        current_image = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
-    else:
-        # Generate a random frame as fallback
-        width, height = 640, 480
-        frame = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)
-        current_image = Image.fromarray(frame)
-    
-    # Clean up previous inference state
-    if current_inference_state is not None:
-        try:
-            if hasattr(current_inference_state, 'clear'):
-                current_inference_state.clear()
-        except:
-            pass
-        del current_inference_state
-        current_inference_state = None
-    
-    # Clear GPU cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Generate inference state
-    current_inference_state = processor.set_image(current_image)
-    
-    # Save current image
-    filename = os.path.join(app.config['UPLOAD_FOLDER'], 'current_image.jpg')
-    current_image.save(filename)
-    
-    # Convert to base64 for display
-    buffered = io.BytesIO()
-    current_image.save(buffered, format="JPEG")
-    img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-    
-    return jsonify({
-        'success': True,
-        'image_data': f"data:image/jpeg;base64,{img_base64}",
-        'image_path': filename,
-        'image_size': {'width': current_image.width, 'height': current_image.height}
-    })
+    zenoh_streamer.stop_stream()
+    return jsonify({'success': True})
+
+@app.route('/get_frame', methods=['GET'])
+def get_frame():
+    if not zenoh_streamer.is_active():
+        return jsonify({'success': False, 'status': 'stopped'})
+    img = zenoh_streamer.get_latest_frame()
+    if not img:
+        return jsonify({'success': True, 'status': 'waiting'})
+    return jsonify({'success': True, 'status': 'streaming', 
+                    'frame_data': ImageProcessor.to_base64(img)})
 
 @app.route('/upload', methods=['POST'])
 def upload_image():
-    global current_image, current_inference_state
-
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image file provided'}), 400
-
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No image selected'}), 400
-
-    if file:
-        # Clean up previous inference state to release GPU memory
-        if current_inference_state is not None:
-            try:
-                if hasattr(current_inference_state, 'clear'):
-                    current_inference_state.clear()
-            except:
-                pass
-            del current_inference_state
-            current_inference_state = None
-        
-        # Clear GPU cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Save uploaded image
-        filename = os.path.join(app.config['UPLOAD_FOLDER'], 'current_image.jpg')
-        file.save(filename)
-
-        # Load and process image
-        current_image = Image.open(filename).convert("RGB")
-
-        # Generate inference state
-        current_inference_state = processor.set_image(current_image)
-
-        # Convert to base64 for display
-        buffered = io.BytesIO()
-        current_image.save(buffered, format="JPEG")
-        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-
-        return jsonify({
-            'success': True,
-            'image_data': f"data:image/jpeg;base64,{img_base64}",
-            'image_path': filename
-        })
-
-@app.route('/predict', methods=['POST'])
-def predict_mask():
-    """Legacy endpoint - kept for compatibility"""
-    return predict_mask_new()
+    if 'image' not in request.files: return jsonify({'error': 'No file'}), 400
+    try:
+        image = Image.open(request.files['image'].stream).convert("RGB")
+        image = ImageProcessor.resize_if_needed(image, CONFIG['MAX_IMAGE_SIZE'])
+        inf_state = model_handler.get_inference_state(image)
+        session_manager.set_image(image, inf_state)
+        return jsonify({'success': True, 'image_data': ImageProcessor.to_base64(image)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/predict_mask', methods=['POST'])
-def predict_mask_new():
-    """Generate mask from points, return overlay and mask"""
-    global current_image, current_inference_state, current_mask, current_overlay
-
-    if current_image is None or current_inference_state is None:
-        return jsonify({'error': 'No image loaded. Please stop video first.'}), 400
-
+def predict_mask():
+    """Generates mask, PUBLISHES it to generate PC, and cleans up."""
     data = request.get_json()
     points = data.get('points', [])
     labels = data.get('labels', [])
 
-    if not points or not labels:
-        return jsonify({'error': 'No points provided'}), 400
+    if not points: return jsonify({'error': 'No points'}), 400
+
+    if session_manager.inference_state is None:
+        if session_manager.current_image:
+            inf_state = model_handler.get_inference_state(session_manager.current_image)
+            session_manager.set_image(session_manager.current_image, inf_state)
+        else:
+            return jsonify({'error': 'No image context'}), 400
 
     try:
-        points_array = np.array(points)
-        labels_array = np.array(labels)
+        points_arr = np.array(points)
+        labels_arr = np.array(labels)
+        masks, scores = model_handler.predict(session_manager.inference_state, points_arr, labels_arr)
+        
+        best_mask = masks[0]
+        session_manager.current_mask = (best_mask > 0).astype(np.uint8) * 255
+        
+        # 1. Publish Mask -> Triggers Env to calculate Point Cloud
+        zenoh_streamer.publish_mask(session_manager.current_mask)
+        
+        overlay_img = ImageProcessor.create_overlay(
+            session_manager.current_image, best_mask, points_arr, labels_arr
+        )
+        session_manager.current_overlay = overlay_img
 
-        # Predict mask and convert to numpy
-        masks, scores, logits = predict_mask_from_points(points_array, labels_array)
-
-        # Save mask (single channel 0-255)
-        current_mask = masks[0].astype(np.uint8) * 255
-
-        # Create overlay (semi-transparent blue mask over original image)
-        overlay = create_overlay_image(current_image, masks[0], points_array, labels_array)
-        current_overlay = overlay
-
-        # Convert overlay to base64
-        buffered = io.BytesIO()
-        overlay.save(buffered, format="PNG")
-        overlay_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-
-        # Convert mask to base64
-        mask_img = Image.fromarray(current_mask, mode='L')
-        buffered_mask = io.BytesIO()
-        mask_img.save(buffered_mask, format="PNG")
-        mask_base64 = base64.b64encode(buffered_mask.getvalue()).decode('utf-8')
-
-        # Save scores for response before cleanup
-        scores_list = scores.tolist() if hasattr(scores, 'tolist') else scores
-
-        # Clean up temporary tensors
-        cleanup_tensors(masks, scores, logits)
+        # 2. Cleanup
+        model_handler.cleanup()
+        session_manager.release_inference()
 
         return jsonify({
             'success': True,
-            'overlay_data': f"data:image/png;base64,{overlay_base64}",
-            'mask_data': f"data:image/png;base64,{mask_base64}",
-            'scores': scores_list,
-            'image_size': {'width': current_image.width, 'height': current_image.height}
+            'overlay_data': ImageProcessor.to_base64(overlay_img, "PNG")
         })
-
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def create_overlay_image(image, mask, points=None, labels=None):
-    """Create overlay image with semi-transparent blue mask"""
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.imshow(image)
+@app.route('/execute_grasp', methods=['POST'])
+def execute_grasp():
+    """
+    Formerly /download.
+    Waits for mask_pc (triggered by predict_mask) and sends Grasp Action.
+    """
+    if session_manager.current_mask is None:
+        return jsonify({'error': 'No mask generated yet.'}), 400
+
+    # Wait for the Point Cloud to arrive from the environment
+    success, result = zenoh_streamer.wait_and_publish_action(timeout=5.0)
     
-    # Show mask with semi-transparent blue
-    show_mask(mask, ax, color=[30/255, 144/255, 255/255, 0.6])
-    
-    # Show points if provided
-    if points is not None and labels is not None:
-        show_points(points, labels, ax)
-    
-    ax.axis('off')
-    
-    # Save to bytes buffer
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    
-    # Load as PIL Image
-    overlay_img = Image.open(buf).convert("RGB")
-    return overlay_img
-
-@app.route('/download_mask', methods=['POST'])
-def download_mask():
-    global current_image, current_inference_state
-
-    if current_image is None or current_inference_state is None:
-        return jsonify({'error': 'No image loaded'}), 400
-
-    data = request.get_json()
-    points = data.get('points', [])
-    labels = data.get('labels', [])
-
-    if not points or not labels:
-        return jsonify({'error': 'No points provided'}), 400
-
-    try:
-        points_array = np.array(points)
-        labels_array = np.array(labels)
-
-        # Predict mask and convert to numpy
-        masks, scores, logits = predict_mask_from_points(points_array, labels_array)
-
-        # Create mask image (grayscale, single channel)
-        mask_array = masks[0].astype(np.uint8) * 255
-        mask_image = Image.fromarray(mask_array, mode='L')
-
-        # Save to bytes buffer
-        buf = io.BytesIO()
-        mask_image.save(buf, format='PNG')
-        buf.seek(0)
-
-        # Clean up temporary tensors
-        cleanup_tensors(masks, scores, logits)
-
-        return send_file(
-            buf,
-            mimetype='image/png',
-            as_attachment=True,
-            download_name='mask_output.png'
-        )
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/download_combined', methods=['POST'])
-def download_combined():
-    global current_image, current_inference_state
-
-    if current_image is None or current_inference_state is None:
-        return jsonify({'error': 'No image loaded'}), 400
-
-    data = request.get_json()
-    points = data.get('points', [])
-    labels = data.get('labels', [])
-
-    if not points or not labels:
-        return jsonify({'error': 'No points provided'}), 400
-
-    try:
-        points_array = np.array(points)
-        labels_array = np.array(labels)
-
-        # Predict mask and convert to numpy
-        masks, scores, logits = predict_mask_from_points(points_array, labels_array)
-
-        # Create combined image with mask overlay
-        fig, ax = plt.subplots(figsize=(10, 10))
-        ax.imshow(current_image)
-
-        for mask in masks:
-            show_mask(mask, ax)
-
-        if points_array is not None and labels_array is not None:
-            show_points(points_array, labels_array, ax)
-
-        ax.axis('off')
-
-        # Save to bytes buffer
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
-        buf.seek(0)
-        plt.close(fig)
-
-        # Clean up temporary tensors
-        cleanup_tensors(masks, scores, logits)
-
-        return send_file(
-            buf,
-            mimetype='image/png',
-            as_attachment=True,
-            download_name='combined_output.png'
-        )
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    if success:
+        return jsonify({'success': True, 'action_id': result, 'message': 'Grasp command sent!'})
+    else:
+        return jsonify({'error': result}), 504 # Gateway Timeout
 
 @app.route('/select_place', methods=['POST'])
 def select_place():
-    """Select 10x10 placement point region, return full-size mask"""
-    global current_image, place_mask
-
-    if current_image is None:
-        return jsonify({'error': 'No image available. Please stop video first.'}), 400
-
+    # Placeholder for place logic if needed
     data = request.get_json()
-    x = data.get('x')
-    y = data.get('y')
+    return jsonify({'success': True})
 
-    if x is None or y is None:
-        return jsonify({'error': 'Placement coordinates not provided'}), 400
-
-    try:
-        h, w = current_image.height, current_image.width
-        
-        # Ensure coordinates are within valid range
-        x = max(0, min(int(x), w - 10))
-        y = max(0, min(int(y), h - 10))
-
-        # Create full-size black background mask (single channel grayscale)
-        # Black background (0) + white selected region (255)
-        full_mask = np.zeros((h, w), dtype=np.uint8)
-        full_mask[y:y+10, x:x+10] = 255
-        place_mask = full_mask
-
-        # Convert to base64 for preview
-        mask_image = Image.fromarray(full_mask, mode='L')
-        buf = io.BytesIO()
-        mask_image.save(buf, format='PNG')
-        buf.seek(0)
-        mask_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-
-        return jsonify({
-            'success': True,
-            'mask_data': f"data:image/png;base64,{mask_base64}",
-            'coordinates': {'x': x, 'y': y},
-            'image_size': {'width': w, 'height': h}
-        })
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/download_region_mask', methods=['POST'])
-def download_region_mask():
-    """Legacy endpoint - kept for compatibility"""
-    return download_place_mask()
-
-@app.route('/download', methods=['POST'])
-def download():
-    """Universal download endpoint for overlay, mask, or place mask"""
-    global current_mask, current_overlay, place_mask
-
-    data = request.get_json()
-    download_type = data.get('type')  # 'overlay', 'mask', or 'place_mask'
-
-    if download_type == 'overlay':
-        if current_overlay is None:
-            return jsonify({'error': 'No overlay available. Please generate mask first.'}), 400
-        buf = io.BytesIO()
-        current_overlay.save(buf, format='PNG')
-        buf.seek(0)
-        return send_file(
-            buf,
-            mimetype='image/png',
-            as_attachment=True,
-            download_name='overlay_output.png'
-        )
-    
-    elif download_type == 'mask':
-        if current_mask is None:
-            return jsonify({'error': 'No mask available. Please generate mask first.'}), 400
-        mask_image = Image.fromarray(current_mask, mode='L')
-        buf = io.BytesIO()
-        mask_image.save(buf, format='PNG')
-        buf.seek(0)
-        return send_file(
-            buf,
-            mimetype='image/png',
-            as_attachment=True,
-            download_name='mask_output.png'
-        )
-    
-    elif download_type == 'place_mask':
-        if place_mask is None:
-            return jsonify({'error': 'No placement mask available. Please select placement point first.'}), 400
-        mask_image = Image.fromarray(place_mask, mode='L')
-        buf = io.BytesIO()
-        mask_image.save(buf, format='PNG')
-        buf.seek(0)
-        return send_file(
-            buf,
-            mimetype='image/png',
-            as_attachment=True,
-            download_name='place_mask.png'
-        )
-    
-    else:
-        return jsonify({'error': 'Invalid download type. Use "overlay", "mask", or "place_mask".'}), 400
-
-def download_place_mask():
-    """Download placement mask"""
-    global place_mask
-
-    if place_mask is None:
-        return jsonify({'error': 'No placement mask available. Please select placement point first.'}), 400
-
-    mask_image = Image.fromarray(place_mask, mode='L')
-    buf = io.BytesIO()
-    mask_image.save(buf, format='PNG')
-    buf.seek(0)
-
-    return send_file(
-        buf,
-        mimetype='image/png',
-        as_attachment=True,
-        download_name='place_mask.png'
-    )
+def signal_handler(sig, frame):
+    model_handler.cleanup()
+    zenoh_streamer.close()
+    sys.exit(0)
 
 if __name__ == '__main__':
-    # Register signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
-    
-    setup_device()
-    setup_model()
-    app.run(host='0.0.0.0', port=50052, debug=True)
+    app.run(host='0.0.0.0', port=50052, debug=False)
