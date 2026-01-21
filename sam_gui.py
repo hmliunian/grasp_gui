@@ -69,21 +69,12 @@ class ImageProcessor:
         return Image.open(io.BytesIO(base64.b64decode(base64_str))).convert("RGB")
 
     @staticmethod
-    def create_overlay(image: Image.Image, mask_array: np.ndarray, points=None, labels=None) -> Image.Image:
-        if mask_array.dtype == bool:
-            mask_uint8 = mask_array.astype(np.uint8) * 255
-        elif np.issubdtype(mask_array.dtype, np.floating) and mask_array.max() <= 1.0:
-            mask_uint8 = (mask_array * 255).astype(np.uint8)
-        else:
-            mask_uint8 = mask_array.astype(np.uint8)
-
-        if mask_uint8.shape[:2] != (image.height, image.width):
-             mask_pil = Image.fromarray(mask_uint8)
-             mask_pil = mask_pil.resize(image.size, Image.Resampling.NEAREST)
-             mask_uint8 = np.array(mask_pil)
-
+    def create_overlay(image: Image.Image, mask_uint8: np.ndarray, points=None, labels=None) -> Image.Image:
+        # Note: mask_uint8 must be (H, W) and match image dimensions
         overlay_rgba = Image.new("RGBA", image.size, (30, 144, 255, 0))
         overlay_np = np.array(overlay_rgba)
+        
+        # Alpha channel: 150 where mask is present
         overlay_np[..., 3] = np.where(mask_uint8 > 0, 150, 0).astype(np.uint8)
         
         overlay_layer = Image.fromarray(overlay_np, "RGBA")
@@ -98,6 +89,48 @@ class ImageProcessor:
                 draw.ellipse((x-r, y-r, x+r, y+r), fill=color, outline="white", width=2)
                 
         return result
+
+    @staticmethod
+    def normalize_mask(mask_raw: np.ndarray, target_pil_size: tuple) -> np.ndarray:
+        """
+        Robustly ensures mask is 2D (H, W), binary uint8 (0 or 255), 
+        and resized to match the target PIL size (W, H).
+        """
+        # 1. Ensure 2D (H, W) by squeezing extra dimensions
+        mask = np.squeeze(mask_raw)
+        if mask.ndim > 2:
+             # Safety fallback: if squeeze still leaves 3D (e.g. C,H,W), take first channel
+             logger.warning(f"Mask raw shape {mask_raw.shape} resulted in {mask.shape} after squeeze. Taking first channel.")
+             mask = mask[0, :, :]
+
+        # 2. Convert to strictly binary uint8 (0 or 255)
+        if mask.dtype == bool:
+            mask_uint8 = (mask * 255).astype(np.uint8)
+        elif np.issubdtype(mask.dtype, np.floating):
+            # Threshold floats. If logits (neg/pos), threshold 0. If prob (0-1), threshold 0.5.
+            threshold = 0.0 if (mask.min() < 0 or mask.max() > 1.0) else 0.5
+            mask_uint8 = (mask > threshold).astype(np.uint8) * 255
+        else:
+            # Handle integer input
+            mask_uint8 = mask.astype(np.uint8)
+            # If it's 0/1, convert to 0/255
+            if mask_uint8.max() <= 1:
+                 mask_uint8 *= 255
+            # Ensure strictly binary 0 or 255
+            mask_uint8 = (mask_uint8 > 127).astype(np.uint8) * 255
+
+        # 3. Resize to match target dimensions if necessary
+        target_w, target_h = target_pil_size
+        current_h, current_w = mask_uint8.shape
+
+        if (current_w, current_h) != (target_w, target_h):
+             logger.info(f"Resizing mask from ({current_w}, {current_h}) to ({target_w}, {target_h})")
+             # Use PIL for resizing binary masks (NEAREST neighbor is crucial)
+             mask_pil = Image.fromarray(mask_uint8)
+             mask_pil = mask_pil.resize((target_w, target_h), Image.Resampling.NEAREST)
+             mask_uint8 = np.array(mask_pil)
+             
+        return mask_uint8
 
 class ImageDecoders:
     @staticmethod
@@ -191,6 +224,7 @@ class ZenohStreamer:
         if not self.publisher_mask and self.session: self.start_stream()
         if not self.publisher_mask: return
         try:
+            # mask_arr must be (H, W) uint8
             success, encoded_mask = cv2.imencode(".png", mask_arr)
             if success:
                 out = ImageData()
@@ -201,7 +235,7 @@ class ZenohStreamer:
                 out.data = encoded_mask.tobytes()
                 with self._lock: self._latest_mask_pc = None 
                 self.publisher_mask.put(out.SerializeToString())
-                logger.info(f"Mask published to Zenoh.")
+                logger.info(f"Mask published (Shape: {mask_arr.shape})")
         except Exception as e:
             logger.error(f"Failed to publish mask: {e}")
 
@@ -377,21 +411,35 @@ def predict_mask(data: PointsData):
     if not data.points:
         return JSONResponse(status_code=400, content={"error": "No points provided"})
     try:
+        # 1. Capture Full Res
         _capture_and_encode_latest_frame()
         points_arr = np.array(data.points)
         labels_arr = np.array(data.labels)
+        
+        # 2. SAM Prediction
         masks, scores = model_handler.predict(session_manager.inference_state, points_arr, labels_arr)
-        best_mask = masks[0]
-        session_manager.current_mask = (best_mask > 0).astype(np.uint8) * 255
+        
+        # 3. Normalize Mask (Critical Fix: Resize to match image dimensions)
+        target_size = session_manager.current_image.size # (W, H)
+        final_mask = ImageProcessor.normalize_mask(masks[0], target_size)
+        
+        session_manager.current_mask = final_mask
         session_manager.mask_source_mode = 'sam3'
+        
+        # 4. Publish correct size mask
         zenoh_streamer.publish_mask(session_manager.current_mask)
+        
+        # 5. Create Overlay
         overlay_img = ImageProcessor.create_overlay(
-            session_manager.current_image, best_mask, points_arr, labels_arr
+            session_manager.current_image, final_mask, points_arr, labels_arr
         )
         session_manager.current_overlay = overlay_img
+
         return {"success": True}
     except Exception as e:
         logger.error(f"Prediction Error: {e}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/external/send_image")
@@ -436,10 +484,13 @@ async def external_receive_mask_post(data: ExternalMaskData):
     try:
         mask_data = data.mask_data
         mask_img = ImageProcessor.from_base64(mask_data).convert('L')
-        if mask_img.size != session_manager.current_image.size:
-            mask_img = mask_img.resize(session_manager.current_image.size, Image.Resampling.NEAREST)
-        mask_array = np.array(mask_img, dtype=np.uint8)
-        session_manager.external_mask_buffer = np.clip(mask_array, 0, 255)
+        mask_array = np.array(mask_img)
+        
+        # Normalize Mask (Resize to match current image)
+        target_size = session_manager.current_image.size
+        final_mask = ImageProcessor.normalize_mask(mask_array, target_size)
+
+        session_manager.external_mask_buffer = final_mask
         return {"success": True, "message": "Mask stored in buffer"}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Failed to process mask: {str(e)}"})
@@ -472,8 +523,7 @@ async def execute_grasp():
         return JSONResponse(status_code=400, content={"error": "No mask generated yet."})
     success, result = await zenoh_streamer.wait_and_publish_action(timeout=5.0)
     if success:
-        # Changed: Do NOT clear the overlay. User can re-execute.
-        # session_manager.current_overlay = None 
+        # Don't clear overlay, allow re-execution
         return {"success": True, "action_id": result, "message": "Grasp command sent!"}
     else:
         return JSONResponse(status_code=504, content={"error": result})
