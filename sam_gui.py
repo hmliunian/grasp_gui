@@ -13,7 +13,7 @@ import cv2
 import torch
 import zenoh
 import requests
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -30,12 +30,11 @@ from generated.action_pb2 import GraspGoal
 # --- Configuration ---
 CONFIG = {
     'CHECKPOINT_PATH': "compute/third_party/sam3/ckp/sam3.pt",
-    'MAX_IMAGE_SIZE': 1024,
     'DEVICE': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
     'CAMERA_ID': "SN_57524755", 
     'ZENOH_ROUTER': "tcp/10.42.0.220:7447#so_sndbuf=52428800",
     'ACTION_GRASP_GOAL': "arm/action/grasp/goal",
-    'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://localhost:50053/api/process_image")
+    'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://noelia-pupillary-uneccentrically.ngrok-free.dev/api/process_image")
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,19 +54,6 @@ class PlaceData(BaseModel):
 
 # --- Helper Classes ---
 class ImageProcessor:
-    @staticmethod
-    def resize_if_needed(image: Image.Image, max_size: int) -> Tuple[Image.Image, float]:
-        """
-        Resizes image if needed and returns the scale factor used.
-        Returns: (resized_image, scale_factor)
-        """
-        w, h = image.size
-        if max(w, h) > max_size:
-            scale = max_size / max(w, h)
-            new_w, new_h = int(w * scale), int(h * scale)
-            return image.resize((new_w, new_h), Image.Resampling.LANCZOS), scale
-        return image, 1.0
-
     @staticmethod
     def to_base64(image: Image.Image, fmt: str = "JPEG", quality: int = 85) -> str:
         buf = io.BytesIO()
@@ -125,7 +111,7 @@ class ImageDecoders:
             pass
         return None
 
-# --- Zenoh Logic (Unchanged) ---
+# --- Zenoh Logic ---
 class ZenohStreamer:
     def __init__(self):
         self.session = None
@@ -342,33 +328,19 @@ app = FastAPI(title="SAM3 Robot Teleop")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="compute/third_party/grasp_gui/templates")
 
-# Initialize Global Handlers
 model_handler = SAM3ModelHandler()
 session_manager = SessionManager()
 zenoh_streamer = ZenohStreamer()
 
 zenoh_streamer.start_stream()
 
-# --- Helper for Synchronization ---
-def _capture_and_encode_latest_frame() -> float:
-    """
-    Grabs the absolute latest frame, resizes it for SAM3,
-    and updates session state.
-    Returns: The scale factor (Processed / Original)
-    """
+def _capture_and_encode_latest_frame():
     latest_img = zenoh_streamer.get_latest_frame()
     if latest_img is None:
         raise ValueError("No video stream frame available yet.")
-    
-    # Process and get Scale Factor
-    processed_img, scale_factor = ImageProcessor.resize_if_needed(latest_img, CONFIG['MAX_IMAGE_SIZE'])
-    
-    logger.info(f"Encoding new frame. Scale Factor: {scale_factor:.3f}")
-    
-    inf_state = model_handler.get_inference_state(processed_img)
-    session_manager.set_image(processed_img, inf_state)
-    
-    return scale_factor
+    logger.info(f"Encoding new frame (Full Res: {latest_img.size})...")
+    inf_state = model_handler.get_inference_state(latest_img)
+    session_manager.set_image(latest_img, inf_state)
 
 # --- Endpoints ---
 
@@ -404,38 +376,20 @@ async def reset_session():
 def predict_mask(data: PointsData):
     if not data.points:
         return JSONResponse(status_code=400, content={"error": "No points provided"})
-
     try:
-        # 1. Capture & Resize
-        # Returns the scale factor needed to map Frontend Points -> Backend Processed Image
-        scale_factor = _capture_and_encode_latest_frame()
-
-        # 2. Scale Points
+        _capture_and_encode_latest_frame()
         points_arr = np.array(data.points)
-        
-        # Apply scaling if resizing happened
-        if scale_factor != 1.0:
-            points_arr = points_arr * scale_factor
-            logger.info(f"Scaled points by {scale_factor}")
-
         labels_arr = np.array(data.labels)
-        
-        # 3. Predict
         masks, scores = model_handler.predict(session_manager.inference_state, points_arr, labels_arr)
-        
         best_mask = masks[0]
         session_manager.current_mask = (best_mask > 0).astype(np.uint8) * 255
         session_manager.mask_source_mode = 'sam3'
-        
         zenoh_streamer.publish_mask(session_manager.current_mask)
-        
         overlay_img = ImageProcessor.create_overlay(
             session_manager.current_image, best_mask, points_arr, labels_arr
         )
         session_manager.current_overlay = overlay_img
-
         return {"success": True}
-
     except Exception as e:
         logger.error(f"Prediction Error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -444,32 +398,21 @@ def predict_mask(data: PointsData):
 async def external_send_image():
     try:
         loop = asyncio.get_event_loop()
-        
-        # We assume external service handles the raw size, or we send resized? 
-        # Usually external vision models expect standard sizes, so we send the PROCESSED image from SessionManager.
-        # But wait, we must run capture first.
-        
-        # Capture & Encode (populate session_manager.current_image with RESIZED image)
         await loop.run_in_executor(None, _capture_and_encode_latest_frame)
-
-        # Send the resized image to external service
         img_base64 = ImageProcessor.to_base64(session_manager.current_image, "PNG")
         payload = {
             'image': img_base64,
             'width': session_manager.current_image.width,
             'height': session_manager.current_image.height
         }
-
         session_manager.external_mask_buffer = None
         session_manager.external_mask_locked = False
         session_manager.mask_source_mode = 'external'
-
         response = await loop.run_in_executor(
             None, 
             lambda: requests.post(CONFIG['EXTERNAL_SERVICE_URL'], json=payload, timeout=10)
         )
         response.raise_for_status()
-
         return {"success": True}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Failed: {str(e)}"})
@@ -510,7 +453,6 @@ def external_receive_mask_get(confirm: bool = False):
     try:
         mask_buffer = session_manager.external_mask_buffer
         overlay_img = ImageProcessor.create_overlay(session_manager.current_image, mask_buffer)
-        
         if confirm:
             session_manager.current_mask = mask_buffer.copy()
             session_manager.current_overlay = overlay_img
@@ -530,7 +472,8 @@ async def execute_grasp():
         return JSONResponse(status_code=400, content={"error": "No mask generated yet."})
     success, result = await zenoh_streamer.wait_and_publish_action(timeout=5.0)
     if success:
-        session_manager.current_overlay = None
+        # Changed: Do NOT clear the overlay. User can re-execute.
+        # session_manager.current_overlay = None 
         return {"success": True, "action_id": result, "message": "Grasp command sent!"}
     else:
         return JSONResponse(status_code=504, content={"error": result})

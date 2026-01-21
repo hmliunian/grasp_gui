@@ -13,15 +13,11 @@
             min-height: 100vh; display: flex; flex-direction: column;
         }
         
-        /* --- Header --- */
         .header {
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             padding: 10px 20px; 
-            display: flex; 
-            align-items: center; 
-            justify-content: space-between;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            height: 70px;
+            display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1); height: 70px;
         }
         
         .header-left { display: flex; flex-direction: column; justify-content: center; }
@@ -32,7 +28,6 @@
 
         .header-right { display: flex; align-items: center; gap: 15px; }
 
-        /* Status Badge */
         .status-badge {
             font-size: 11px; padding: 4px 10px; border-radius: 20px; background: #333; 
             color: #888; display: flex; align-items: center; gap: 6px; border: 1px solid #444;
@@ -41,23 +36,15 @@
         .status-online .status-dot { background: #10b981; box-shadow: 0 0 5px #10b981; }
         .status-online { color: #10b981; background: rgba(16, 185, 129, 0.1); border-color: rgba(16, 185, 129, 0.3); }
 
-        /* Reset Button (Icon Style) */
         .btn-reset-icon {
-            background: #ef4444;
-            color: white;
-            border: none;
-            width: 40px; height: 40px;
-            border-radius: 8px;
-            cursor: pointer;
-            display: flex; align-items: center; justify-content: center;
-            transition: all 0.2s;
-            box-shadow: 0 4px 10px rgba(239, 68, 68, 0.3);
+            background: #ef4444; color: white; border: none; width: 40px; height: 40px;
+            border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center;
+            transition: all 0.2s; box-shadow: 0 4px 10px rgba(239, 68, 68, 0.3);
         }
         .btn-reset-icon:hover { background: #dc2626; transform: scale(1.05); }
         .btn-reset-icon:active { transform: scale(0.95); }
         .btn-reset-icon svg { width: 20px; height: 20px; fill: currentColor; }
 
-        /* --- Main Layout --- */
         .main-container {
             display: flex; flex: 1; gap: 20px; padding: 20px; 
             max-width: 1600px; margin: 0 auto; width: 100%;
@@ -74,7 +61,6 @@
             max-width: 100%; max-height: 80vh; border-radius: 4px; 
             cursor: crosshair; display: block; background: #000;
         }
-        /* No Select / Context Menu */
         #mainCanvas { user-select: none; -webkit-user-select: none; }
 
         .control-section { width: 320px; display: flex; flex-direction: column; gap: 12px; }
@@ -336,40 +322,39 @@
             } finally { setLoading(false); }
         }
 
+        // --- UPDATED EXECUTE HANDLER (No Alert, No Reset) ---
         btns.execute.addEventListener('click', async () => {
             setLoading(true, "Calculating Grasp...", "Syncing with Point Cloud...");
             try {
                 const res = await fetch('/execute_grasp', { method: 'POST' });
                 const data = await res.json();
                 if (data.success) {
-                    alert(`✅ Command Sent! ID: ${data.action_id}`);
-                    resetState(); 
-                } else alert(`❌ Failed: ${data.error}`);
+                    console.log(`Command Sent! ID: ${data.action_id}`);
+                    // Optional: temporary feedback on button
+                    const origText = btns.execute.innerText;
+                    btns.execute.innerText = "✅ Sent!";
+                    setTimeout(() => btns.execute.innerText = origText, 2000);
+                } else {
+                    alert(`❌ Failed: ${data.error}`);
+                }
             } catch (e) { alert("Network Error"); }
             finally { setLoading(false); }
         });
 
-        // --- NEW RESET LOGIC ---
         btns.reset.addEventListener('click', resetState);
 
         async function resetState() {
             setLoading(true, "Resetting...");
             try {
-                // Call backend to clear the overlay
                 await fetch('/reset', { method: 'POST' });
-                
-                // Clear frontend state
                 state.step = 0;
                 state.points = []; state.labels = [];
                 if (state.maskPollingInterval) clearInterval(state.maskPollingInterval);
                 btns.sendExt.style.display = 'block';
                 btns.confirmExt.style.display = 'none';
                 updateUI();
-            } catch(e) {
-                console.error("Reset failed", e);
-            } finally {
-                setLoading(false);
-            }
+            } catch(e) { console.error(e); } 
+            finally { setLoading(false); }
         }
 
         function renderImage(b64) {
