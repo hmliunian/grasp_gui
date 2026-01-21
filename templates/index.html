@@ -520,6 +520,12 @@
                     clearInterval(externalPreviewInterval);
                     externalPreviewInterval = null;
                 }
+                // If already stopped video (step >= 2), start polling
+                if (state.step >= 2 && state.currentImage) {
+                    startExternalPreviewPolling();
+                    statusReceiveMask.style.display = 'block';
+                    statusReceiveMask.textContent = 'Waiting for mask from external service...';
+                }
             }
             updateButtonStates();
         });
@@ -540,10 +546,7 @@
                 const data = await response.json();
                 if (data.success) {
                     statusSendImage.style.display = 'block';
-                    statusReceiveMask.style.display = 'block';
-                    
-                    // Start polling for preview mask
-                    startExternalPreviewPolling();
+                    // Polling already started after stop_video, no need to start again
                 } else {
                     alert('Error: ' + data.error);
                 }
@@ -562,32 +565,45 @@
                 clearInterval(externalPreviewInterval);
             }
             
-            // Poll every 2 seconds for preview
+            // Poll immediately first time (in case mask was already sent)
+            pollForPreview();
+            
+            // Then poll every 1 second for faster response
             externalPreviewInterval = setInterval(async () => {
-                try {
-                    const response = await fetch('/external/receive_mask');
-                    const data = await response.json();
+                await pollForPreview();
+            }, 1000); // Poll every 1 second for faster response
+        }
+
+        // Poll function for external mask preview
+        async function pollForPreview() {
+            try {
+                const response = await fetch('/external/receive_mask');
+                const data = await response.json();
+                
+                if (data.success && data.preview) {
+                    // Update preview display (don't set state.step or lock)
+                    const img = new Image();
+                    img.onload = () => {
+                        ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
+                    };
+                    img.src = data.overlay_data;
                     
-                    if (data.success && data.preview) {
-                        // Update preview display (don't set state.step or lock)
-                        const img = new Image();
-                        img.onload = () => {
-                            ctx.drawImage(img, 0, 0, mainCanvas.width, mainCanvas.height);
-                        };
-                        img.src = data.overlay_data;
-                        
-                        // Update status
-                        statusReceiveMask.textContent = 'Mask received. Click "Confirm Mask" to use it.';
-                    } else if (data.success && data.locked) {
-                        // Already confirmed, stop polling
+                    // Update status
+                    statusReceiveMask.textContent = 'Mask received. Click "Confirm Mask" to use it.';
+                } else if (data.success && data.locked) {
+                    // Already confirmed, stop polling
+                    if (externalPreviewInterval) {
                         clearInterval(externalPreviewInterval);
                         externalPreviewInterval = null;
                     }
-                } catch (error) {
-                    // Silently ignore errors during polling
-                    console.debug('Preview polling error:', error);
+                } else if (data.error) {
+                    // No mask yet, but keep polling
+                    statusReceiveMask.textContent = 'Waiting for mask from external service...';
                 }
-            }, 2000); // Poll every 2 seconds
+            } catch (error) {
+                // Silently ignore errors during polling
+                console.debug('Preview polling error:', error);
+            }
         }
 
         // External mode: Confirm Mask
@@ -732,6 +748,12 @@
                     if (externalPreviewInterval) {
                         clearInterval(externalPreviewInterval);
                         externalPreviewInterval = null;
+                    }
+                    // Start polling for external mode (if in external mode)
+                    if (state.maskSourceMode === 'external') {
+                        startExternalPreviewPolling();
+                        statusReceiveMask.style.display = 'block';
+                        statusReceiveMask.textContent = 'Waiting for mask from external service...';
                     }
                     updateButtonStates();
                     statusVideo.style.display = 'block';
