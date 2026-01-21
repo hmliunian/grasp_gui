@@ -3,187 +3,137 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SAM3 Robot Teleop</title>
+    <title>SAM3 Live Teleop</title>
     <style>
         /* --- Styles --- */
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0a0a0a;
-            color: #e0e0e0;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0a0a0a; color: #e0e0e0;
+            min-height: 100vh; display: flex; flex-direction: column;
         }
+        
+        /* --- Header --- */
         .header {
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            padding: 15px 25px;
-            display: flex;
+            padding: 10px 20px; 
+            display: flex; 
+            align-items: center; 
             justify-content: space-between;
-            align-items: center;
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            height: 70px;
         }
-        .header h1 { color: #fff; font-size: 22px; margin: 0; }
         
+        .header-left { display: flex; flex-direction: column; justify-content: center; }
+        .header h1 { color: #fff; font-size: 20px; margin: 0; line-height: 1.2; }
+        .header-instructions { font-size: 13px; color: #aaa; margin-top: 4px; }
+        .highlight-pos { color: #10b981; font-weight: bold; }
+        .highlight-neg { color: #ef4444; font-weight: bold; }
+
+        .header-right { display: flex; align-items: center; gap: 15px; }
+
         /* Status Badge */
         .status-badge {
-            font-size: 12px;
-            padding: 5px 10px;
-            border-radius: 20px;
-            background: #333;
-            color: #888;
-            display: flex;
-            align-items: center;
-            gap: 6px;
+            font-size: 11px; padding: 4px 10px; border-radius: 20px; background: #333; 
+            color: #888; display: flex; align-items: center; gap: 6px; border: 1px solid #444;
         }
-        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #666; }
-        .status-online .status-dot { background: #10b981; box-shadow: 0 0 8px #10b981; }
-        .status-online { color: #10b981; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); }
-        .status-offline .status-dot { background: #ef4444; }
-        .status-offline { color: #ef4444; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); }
+        .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #666; }
+        .status-online .status-dot { background: #10b981; box-shadow: 0 0 5px #10b981; }
+        .status-online { color: #10b981; background: rgba(16, 185, 129, 0.1); border-color: rgba(16, 185, 129, 0.3); }
 
+        /* Reset Button (Icon Style) */
+        .btn-reset-icon {
+            background: #ef4444;
+            color: white;
+            border: none;
+            width: 40px; height: 40px;
+            border-radius: 8px;
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            transition: all 0.2s;
+            box-shadow: 0 4px 10px rgba(239, 68, 68, 0.3);
+        }
+        .btn-reset-icon:hover { background: #dc2626; transform: scale(1.05); }
+        .btn-reset-icon:active { transform: scale(0.95); }
+        .btn-reset-icon svg { width: 20px; height: 20px; fill: currentColor; }
+
+        /* --- Main Layout --- */
         .main-container {
-            display: flex;
-            flex: 1;
-            gap: 20px;
-            padding: 20px;
-            max-width: 1600px;
-            margin: 0 auto;
-            width: 100%;
+            display: flex; flex: 1; gap: 20px; padding: 20px; 
+            max-width: 1600px; margin: 0 auto; width: 100%;
         }
         .canvas-section {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            position: relative;
+            flex: 1; display: flex; flex-direction: column; 
+            align-items: center; justify-content: center; position: relative;
         }
         .canvas-wrapper {
-            background: #1a1a1a;
-            border-radius: 12px;
-            padding: 10px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
-            display: inline-block;
+            background: #1a1a1a; border-radius: 12px; padding: 10px; 
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6); display: inline-block;
         }
         #mainCanvas {
-            max-width: 100%;
-            max-height: 80vh;
-            border-radius: 4px;
-            cursor: crosshair;
-            display: block;
-            background: #000;
+            max-width: 100%; max-height: 80vh; border-radius: 4px; 
+            cursor: crosshair; display: block; background: #000;
         }
-        .control-section {
-            width: 320px;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-            height: fit-content;
-        }
+        /* No Select / Context Menu */
+        #mainCanvas { user-select: none; -webkit-user-select: none; }
+
+        .control-section { width: 320px; display: flex; flex-direction: column; gap: 12px; }
+        
         .step-button {
-            width: 100%;
-            padding: 15px;
-            border: none;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            color: white;
-            text-transform: uppercase;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-            position: relative;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
+            width: 100%; padding: 15px; border: none; border-radius: 8px; 
+            font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; 
+            color: white; text-transform: uppercase; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
         }
-        .step-button:disabled {
-            opacity: 0.3;
-            cursor: not-allowed;
-            transform: none !important;
-            box-shadow: none;
-        }
+        .step-button:disabled { opacity: 0.3; cursor: not-allowed; transform: none !important; box-shadow: none; }
         .step-button:not(:disabled):hover { transform: translateY(-2px); filter: brightness(1.1); }
         
-        /* Colors */
-        .step-1 { background: #3b82f6; } 
-        .step-2 { background: #ef4444; } 
-        .step-3 { background: #8b5cf6; } 
-        .step-4 { background: #10b981; } 
-        .step-5 { background: #f59e0b; } 
-        .step-6 { background: #ec4899; } 
-        
-        .step-ext-send { background: #0ea5e9; }
+        .step-sam { background: #8b5cf6; } 
+        .step-ext-send { background: #0ea5e9; } 
         .step-ext-confirm { background: #059669; border: 1px solid #34d399; }
+        .step-place { background: #f59e0b; } 
+        .step-exec { background: #ec4899; } 
 
-        /* External Section Container */
-        .external-panel {
-            background: rgba(255,255,255,0.05);
-            border: 1px dashed #444;
-            border-radius: 8px;
-            padding: 10px;
-            margin: 5px 0;
-        }
+        .external-panel { background: rgba(255,255,255,0.05); border: 1px dashed #444; border-radius: 8px; padding: 10px; margin: 5px 0; }
         .external-panel h3 { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 1px; }
 
         .loading-overlay {
-            position: absolute;
-            top: 50%; left: 50%;
-            transform: translate(-50%, -50%);
-            background: rgba(0,0,0,0.85);
-            padding: 25px;
-            border-radius: 12px;
-            display: none;
-            z-index: 100;
-            text-align: center;
-            border: 1px solid #333;
-            min-width: 200px;
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); 
+            background: rgba(0,0,0,0.85); padding: 25px; border-radius: 12px; display: none; 
+            z-index: 100; text-align: center; border: 1px solid #333; min-width: 200px;
         }
-        .spinner {
-            width: 30px; height: 30px;
-            border: 3px solid #333;
-            border-top: 3px solid #fff;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 15px;
-        }
+        .spinner { width: 30px; height: 30px; border: 3px solid #333; border-top: 3px solid #fff; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 15px; }
         @keyframes spin { 100% { transform: rotate(360deg); } }
 
-        .mode-selector { display: flex; gap: 10px; margin-bottom: 5px; }
-        .mode-btn { 
-            flex: 1; padding: 10px; border: 1px solid #444; 
-            background: transparent; color: #888; cursor: pointer; border-radius: 6px;
-            font-weight: bold;
-        }
-        .mode-btn.active.positive { background: #10b981; color: white; border-color: #10b981; }
-        .mode-btn.active.negative { background: #ef4444; color: white; border-color: #ef4444; }
-        
-        .separator { 
-            text-align: center; color: #555; font-size: 11px; margin: 10px 0; 
-            position: relative; 
-        }
-        .separator::before, .separator::after {
-            content: ""; position: absolute; top: 50%; width: 40%; height: 1px; background: #333;
-        }
-        .separator::before { left: 0; }
-        .separator::after { right: 0; }
+        .separator { text-align: center; color: #555; font-size: 11px; margin: 10px 0; position: relative; }
+        .separator::before, .separator::after { content: ""; position: absolute; top: 50%; width: 40%; height: 1px; background: #333; }
+        .separator::before { left: 0; } .separator::after { right: 0; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🎯 SAM3 Robot Teleop</h1>
-        <div id="extServiceStatus" class="status-badge">
-            <div class="status-dot"></div>
-            <span id="extStatusText">Checking Service...</span>
+        <div class="header-left">
+            <h1>🎯 SAM3 Live Teleop</h1>
+            <p class="header-instructions">
+                <span class="highlight-pos">L-Click: Add Pos</span> | 
+                <span class="highlight-neg">R-Click: Add Neg</span> | 
+                Dbl-Click: Remove
+            </p>
+        </div>
+        <div class="header-right">
+            <div id="extServiceStatus" class="status-badge">
+                <div class="status-dot"></div><span id="extStatusText">Checking...</span>
+            </div>
+            
+            <button class="btn-reset-icon" id="btnReset" title="Reset to Live Stream">
+                <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+            </button>
         </div>
     </div>
 
     <div class="main-container">
         <div class="canvas-section">
             <div class="canvas-wrapper">
-                <canvas id="mainCanvas"></canvas>
+                <canvas id="mainCanvas" oncontextmenu="return false;"></canvas>
             </div>
             <div class="loading-overlay" id="loading">
                 <div class="spinner"></div>
@@ -193,76 +143,52 @@
         </div>
 
         <div class="control-section">
-            <button class="step-button step-1" id="btnStartVideo">Start Stream</button>
-            <button class="step-button step-2" id="btnStopVideo" disabled>Stop & Capture</button>
-
-            <button class="step-button step-3" id="btnAddPoints" disabled>Annotate Points</button>
-            <div class="mode-selector" id="modeSelector" style="display: none;">
-                <button class="mode-btn positive active" id="btnPositive">Positive (+)</button>
-                <button class="mode-btn negative" id="btnNegative">Negative (-)</button>
-            </div>
-            <button class="step-button step-4" id="btnGenerateMask" disabled>Segment (SAM3)</button>
+            <button class="step-button step-sam" id="btnGenerateMask" disabled>Segment View (SAM3)</button>
 
             <div class="separator">OR USE EXTERNAL</div>
 
             <div class="external-panel">
                 <h3>External Model</h3>
-                <button class="step-button step-ext-send" id="btnSendExternal" disabled>
-                    Send to External
-                </button>
-                <button class="step-button step-ext-confirm" id="btnConfirmExternal" style="display:none; margin-top:10px;">
-                    Confirm Mask
-                </button>
+                <button class="step-button step-ext-send" id="btnSendExternal" disabled>Send View</button>
+                <button class="step-button step-ext-confirm" id="btnConfirmExternal" style="display:none; margin-top:10px;">Confirm Mask</button>
             </div>
 
             <div class="separator">ACTION</div>
 
-            <button class="step-button step-5" id="btnSelectPlace" disabled>Select Place</button>
-            <button class="step-button step-6" id="btnExecuteGrasp" disabled>Execute Grasp</button>
+            <button class="step-button step-place" id="btnSelectPlace" disabled>Select Place Goal</button>
+            <button class="step-button step-exec" id="btnExecuteGrasp" disabled>Execute Grasp</button>
         </div>
     </div>
 
     <script>
-        // --- State Management ---
         const state = {
-            step: 0,
+            step: 0, 
             pollingInterval: null,
             maskPollingInterval: null,
             points: [],
             labels: [],
-            currentMode: 'positive',
-            currentImage: null, 
-            currentOverlay: null,
-            maskSource: null, // 'sam3' or 'external'
-            externalServiceOnline: false
+            externalServiceOnline: false,
+            clickTimer: null
         };
 
-        // --- Elements ---
         const canvas = document.getElementById('mainCanvas');
         const ctx = canvas.getContext('2d');
         const loading = document.getElementById('loading');
         
-        // Buttons
         const btns = {
-            start: document.getElementById('btnStartVideo'),
-            stop: document.getElementById('btnStopVideo'),
-            points: document.getElementById('btnAddPoints'),
             mask: document.getElementById('btnGenerateMask'),
             sendExt: document.getElementById('btnSendExternal'),
             confirmExt: document.getElementById('btnConfirmExternal'),
             place: document.getElementById('btnSelectPlace'),
             execute: document.getElementById('btnExecuteGrasp'),
-            pos: document.getElementById('btnPositive'),
-            neg: document.getElementById('btnNegative')
+            reset: document.getElementById('btnReset')
         };
 
-        // --- Init ---
-        canvas.width = 640;
-        canvas.height = 480;
-        drawPlaceholder();
+        canvas.width = 640; canvas.height = 480;
+        drawPlaceholder("Waiting for video stream...");
         checkExternalHealth();
+        state.pollingInterval = setInterval(pollVideoFrame, 50);
 
-        // --- Health Check ---
         async function checkExternalHealth() {
             const badge = document.getElementById('extServiceStatus');
             const text = document.getElementById('extStatusText');
@@ -270,108 +196,74 @@
                 const res = await fetch('/external/health');
                 const data = await res.json();
                 if (data.status === 'online') {
-                    badge.className = 'status-badge status-online';
-                    text.innerText = "External Service Online";
+                    badge.className = 'status-badge status-online'; text.innerText = "Ext Online";
                     state.externalServiceOnline = true;
-                } else {
-                    throw new Error('Offline');
-                }
+                } else throw new Error();
             } catch (e) {
-                badge.className = 'status-badge status-offline';
-                text.innerText = "External Service Offline";
+                badge.className = 'status-badge status-offline'; text.innerText = "Ext Offline";
                 state.externalServiceOnline = false;
             }
+            updateUI();
         }
 
-        // --- 1. Video Streaming ---
-        btns.start.addEventListener('click', async () => {
-            setLoading(true, "Starting Stream...");
-            try {
-                const res = await fetch('/start_video', { method: 'POST' });
-                const data = await res.json();
-                if (data.success) {
-                    state.step = 1;
-                    updateUI();
-                    if (state.pollingInterval) clearInterval(state.pollingInterval);
-                    state.pollingInterval = setInterval(pollVideoFrame, 40); 
-                }
-            } catch (e) { alert("Stream failed"); } 
-            finally { setLoading(false); }
-        });
-
+        let lastFrameData = null;
         async function pollVideoFrame() {
             try {
                 const res = await fetch('/get_frame');
                 const data = await res.json();
-                if (data.success && data.frame_data) renderImage(data.frame_data);
+                if (data.success && data.frame_data) {
+                    if (lastFrameData !== data.frame_data || state.points.length > 0) {
+                        renderImage(data.frame_data);
+                        lastFrameData = data.frame_data;
+                    }
+                }
             } catch (e) { console.error(e); }
         }
 
-        // --- 2. Stop & Capture ---
-        btns.stop.addEventListener('click', async () => {
-            clearInterval(state.pollingInterval);
-            setLoading(true, "Capturing & Encoding...");
-            
-            try {
-                await fetch('/stop_video', { method: 'POST' });
-                
-                canvas.toBlob(async (blob) => {
-                    const formData = new FormData();
-                    formData.append('image', blob, 'capture.jpg');
-                    
-                    const res = await fetch('/upload', { method: 'POST', body: formData });
-                    const data = await res.json();
-                    
-                    if (data.success) {
-                        state.currentImage = data.image_data;
-                        state.points = []; state.labels = [];
-                        state.currentOverlay = null; state.maskSource = null;
-                        renderImage(state.currentImage);
-                        state.step = 2;
-                        updateUI();
-                    }
-                    setLoading(false);
-                }, 'image/jpeg', 0.95);
-            } catch (e) { 
-                alert("Capture error"); setLoading(false); 
+        function getCanvasCoordinates(e) {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: (e.clientX - rect.left) * (canvas.width / rect.width),
+                y: (e.clientY - rect.top) * (canvas.height / rect.height)
+            };
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (state.step !== 0 && state.step !== 2) return;
+            const coords = getCanvasCoordinates(e);
+
+            if (state.step === 2) {
+                handlePlaceSelection(coords.x, coords.y);
+                return;
+            }
+
+            if (state.clickTimer === null) {
+                state.clickTimer = setTimeout(() => {
+                    state.clickTimer = null;
+                    const label = e.button === 2 ? 0 : 1; 
+                    state.points.push([coords.x, coords.y]);
+                    state.labels.push(label);
+                    if (lastFrameData) renderImage(lastFrameData);
+                    updateUI();
+                }, 250); 
             }
         });
 
-        // --- 3. Annotation (SAM3) ---
-        btns.points.addEventListener('click', () => {
-            state.step = 3;
-            document.getElementById('modeSelector').style.display = 'flex';
-            updateUI();
-        });
-
-        canvas.addEventListener('mousedown', (e) => {
-            if (state.step !== 3 && state.step !== 5) return;
-            
-            const rect = canvas.getBoundingClientRect();
-            const scaleX = canvas.width / rect.width;
-            const scaleY = canvas.height / rect.height;
-            const x = (e.clientX - rect.left) * scaleX;
-            const y = (e.clientY - rect.top) * scaleY;
-
-            if (state.step === 3) {
-                // Add/Remove Point Logic
-                const clickedIndex = state.points.findIndex(p => Math.hypot(p[0]-x, p[1]-y) < 15);
-                if (clickedIndex >= 0) {
-                    state.points.splice(clickedIndex, 1);
-                    state.labels.splice(clickedIndex, 1);
-                } else {
-                    state.points.push([x, y]);
-                    state.labels.push(state.currentMode === 'positive' ? 1 : 0);
-                }
-                redrawCanvas();
+        canvas.addEventListener('dblclick', (e) => {
+            if (state.step !== 0) return;
+            clearTimeout(state.clickTimer); state.clickTimer = null;
+            const coords = getCanvasCoordinates(e);
+            const clickedIndex = state.points.findIndex(p => Math.hypot(p[0]-coords.x, p[1]-coords.y) < 20);
+            if (clickedIndex >= 0) {
+                state.points.splice(clickedIndex, 1);
+                state.labels.splice(clickedIndex, 1);
+                if (lastFrameData) renderImage(lastFrameData);
                 updateUI();
-            } else if (state.step === 5) {
-                handlePlaceSelection(x, y);
             }
         });
 
         btns.mask.addEventListener('click', async () => {
-            setLoading(true, "Running SAM3...");
+            setLoading(true, "Capturing & Segmenting...", "Freezing view...");
             try {
                 const res = await fetch('/predict_mask', {
                     method: 'POST',
@@ -380,84 +272,53 @@
                 });
                 const data = await res.json();
                 if (data.success) {
-                    state.currentOverlay = data.overlay_data;
-                    state.maskSource = 'sam3';
-                    state.step = 4;
-                    redrawCanvas();
+                    state.step = 1; 
                     updateUI();
-                }
-            } catch (e) { alert("Segmentation failed"); }
+                } else throw new Error(data.error);
+            } catch (e) { alert("Error: " + e.message); }
             finally { setLoading(false); }
         });
 
-        // --- 4. External Auto-Segment ---
         btns.sendExt.addEventListener('click', async () => {
-            setLoading(true, "Sending to External...", "Please wait...");
+            setLoading(true, "Sending...", "Freezing view...");
             try {
-                // 1. Send Image
                 const sendRes = await fetch('/external/send_image', { method: 'POST' });
-                if (!sendRes.ok) throw new Error("Failed to send image");
-                
-                // 2. Start Polling for Result
+                if (!sendRes.ok) throw new Error("Failed to send");
                 setLoading(true, "Waiting for External Mask...", "Polling...");
                 startMaskPolling();
-            } catch (e) {
-                alert("Error: " + e.message);
-                setLoading(false);
-            }
+            } catch (e) { alert(e.message); setLoading(false); }
         });
 
         function startMaskPolling() {
             let attempts = 0;
-            const maxAttempts = 60; // 30 seconds (500ms * 60)
-            
             if (state.maskPollingInterval) clearInterval(state.maskPollingInterval);
-            
             state.maskPollingInterval = setInterval(async () => {
                 attempts++;
                 try {
-                    // Check for preview (confirm=false)
                     const res = await fetch('/external/receive_mask?confirm=false');
                     const data = await res.json();
-                    
-                    if (data.success && data.overlay_data) {
-                        // Found it!
+                    if (data.success && data.preview) {
                         clearInterval(state.maskPollingInterval);
-                        state.currentOverlay = data.overlay_data;
-                        redrawCanvas();
-                        
-                        // Switch UI to confirmation mode
+                        state.step = 1; 
                         btns.sendExt.style.display = 'none';
                         btns.confirmExt.style.display = 'block';
-                        btns.confirmExt.innerText = "Confirm External Mask";
                         setLoading(false);
-                    } else if (attempts >= maxAttempts) {
+                        updateUI();
+                    } else if (attempts >= 60) {
                         clearInterval(state.maskPollingInterval);
-                        setLoading(false);
-                        alert("Timed out waiting for external mask.");
+                        setLoading(false); alert("Timeout.");
                     }
-                } catch (e) {
-                    console.warn("Polling error", e);
-                }
+                } catch (e) { }
             }, 500);
         }
 
         btns.confirmExt.addEventListener('click', async () => {
-            setLoading(true, "Finalizing Mask...");
-            try {
-                const res = await fetch('/external/receive_mask?confirm=true');
-                const data = await res.json();
-                if (data.success) {
-                    state.maskSource = 'external';
-                    state.step = 4;
-                    updateUI();
-                }
-            } catch (e) { alert("Confirmation failed"); }
-            finally { setLoading(false); }
+            setLoading(true, "Confirming...");
+            try { await fetch('/external/receive_mask?confirm=true'); updateUI(); } 
+            catch (e) { alert("Failed"); } finally { setLoading(false); }
         });
 
-        // --- 5 & 6. Place & Execute ---
-        btns.place.addEventListener('click', () => { state.step = 5; updateUI(); });
+        btns.place.addEventListener('click', () => { state.step = 2; updateUI(); });
 
         async function handlePlaceSelection(x, y) {
             setLoading(true, "Recording Target...");
@@ -467,9 +328,8 @@
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ x, y })
                 });
-                state.step = 6;
-                redrawCanvas();
-                // Draw selection box
+                state.step = 3; 
+                if (lastFrameData) renderImage(lastFrameData); 
                 ctx.strokeStyle = "yellow"; ctx.lineWidth = 3;
                 ctx.strokeRect(x-10, y-10, 20, 20);
                 updateUI();
@@ -477,68 +337,72 @@
         }
 
         btns.execute.addEventListener('click', async () => {
-            setLoading(true, "Calculating 3D Grasp...", "Syncing with Point Cloud...");
+            setLoading(true, "Calculating Grasp...", "Syncing with Point Cloud...");
             try {
                 const res = await fetch('/execute_grasp', { method: 'POST' });
                 const data = await res.json();
-                if (data.success) alert(`✅ Command Sent!\nID: ${data.action_id}`);
-                else alert(`❌ Failed: ${data.error}`);
-            } catch (e) { alert("Execution Network Error"); }
+                if (data.success) {
+                    alert(`✅ Command Sent! ID: ${data.action_id}`);
+                    resetState(); 
+                } else alert(`❌ Failed: ${data.error}`);
+            } catch (e) { alert("Network Error"); }
             finally { setLoading(false); }
         });
 
-        // --- Helpers ---
+        // --- NEW RESET LOGIC ---
+        btns.reset.addEventListener('click', resetState);
+
+        async function resetState() {
+            setLoading(true, "Resetting...");
+            try {
+                // Call backend to clear the overlay
+                await fetch('/reset', { method: 'POST' });
+                
+                // Clear frontend state
+                state.step = 0;
+                state.points = []; state.labels = [];
+                if (state.maskPollingInterval) clearInterval(state.maskPollingInterval);
+                btns.sendExt.style.display = 'block';
+                btns.confirmExt.style.display = 'none';
+                updateUI();
+            } catch(e) {
+                console.error("Reset failed", e);
+            } finally {
+                setLoading(false);
+            }
+        }
+
         function renderImage(b64) {
             const img = new Image();
             img.onload = () => {
                 canvas.width = img.width; canvas.height = img.height;
                 ctx.drawImage(img, 0, 0);
-                if (state.step >= 3 && !state.maskSource) drawPoints();
+                if (state.step === 0) drawPoints();
             };
             img.src = b64;
         }
 
-        function redrawCanvas() {
-            const src = (state.step >= 4 || (state.currentOverlay && btns.confirmExt.offsetParent !== null)) 
-                ? state.currentOverlay : state.currentImage;
-            if (src) renderImage(src);
-        }
-
         function drawPoints() {
             state.points.forEach((p, i) => {
-                ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, Math.PI*2);
+                ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, Math.PI*2);
                 ctx.fillStyle = state.labels[i] === 1 ? '#10b981' : '#ef4444';
-                ctx.fill(); ctx.stroke();
+                ctx.fill(); ctx.strokeStyle = 'white'; ctx.lineWidth = 2; ctx.stroke();
             });
         }
 
-        function drawPlaceholder() {
+        function drawPlaceholder(text) {
             ctx.fillStyle = "#111"; ctx.fillRect(0,0,640,480);
             ctx.fillStyle = "#555"; ctx.font = "20px Arial";
-            ctx.textAlign = "center"; ctx.fillText("Ready", 320, 240);
+            ctx.textAlign = "center"; ctx.fillText(text, 320, 240);
         }
 
         function updateUI() {
-            // Reset External Button State
-            if (state.step <= 2) {
-                btns.sendExt.style.display = 'block';
-                btns.confirmExt.style.display = 'none';
-            }
-
-            // Button Enable/Disable Logic
-            btns.stop.disabled = (state.step !== 1);
-            btns.start.disabled = (state.step === 1);
-            
-            const hasImage = state.step >= 2;
-            btns.points.disabled = !hasImage;
-            btns.sendExt.disabled = !(hasImage && state.externalServiceOnline);
-            
-            const hasPoints = state.points.length > 0;
-            btns.mask.disabled = !(state.step === 3 && hasPoints);
-
-            const maskReady = state.step >= 4;
-            btns.place.disabled = !maskReady;
-            btns.execute.disabled = !maskReady; // Can execute immediately if no place needed
+            btns.mask.disabled = state.step !== 0 || state.points.length === 0;
+            btns.sendExt.disabled = state.step !== 0 || !state.externalServiceOnline;
+            const maskExists = state.step >= 1;
+            btns.place.disabled = !maskExists;
+            btns.execute.disabled = !maskExists;
+            canvas.style.cursor = state.step === 2 ? 'target' : 'crosshair';
         }
 
         function setLoading(active, text="Processing...", subtext="") {
@@ -546,10 +410,6 @@
             document.getElementById('loadingText').innerText = text;
             document.getElementById('loadingSubText').innerText = subtext;
         }
-
-        // Mode Toggles
-        btns.pos.onclick = () => { state.currentMode='positive'; btns.pos.classList.add('active'); btns.neg.classList.remove('active'); };
-        btns.neg.onclick = () => { state.currentMode='negative'; btns.neg.classList.add('active'); btns.pos.classList.remove('active'); };
     </script>
 </body>
 </html>

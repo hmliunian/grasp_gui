@@ -1,7 +1,6 @@
 import os
 import io
 import sys
-import gc
 import uuid
 import time
 import signal
@@ -14,30 +13,22 @@ import cv2
 import torch
 import zenoh
 import requests
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-# FastAPI Imports
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from PIL import Image, ImageDraw
 
-# --- SAM3 Imports ---
-# Ensure these are in your python path
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
-
-# --- Protobuf Imports ---
 from generated.image_pb2 import ImageData
 from generated.action_pb2 import GraspGoal
-from generated.types_pb2 import Pose, Vector3, Quaternion
-import uvicorn
 
 # --- Configuration ---
 CONFIG = {
-    'UPLOAD_FOLDER': 'static/uploads',
     'CHECKPOINT_PATH': "compute/third_party/sam3/ckp/sam3.pt",
     'MAX_IMAGE_SIZE': 1024,
     'DEVICE': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
@@ -63,16 +54,19 @@ class PlaceData(BaseModel):
     y: float
 
 # --- Helper Classes ---
-
 class ImageProcessor:
     @staticmethod
-    def resize_if_needed(image: Image.Image, max_size: int) -> Image.Image:
+    def resize_if_needed(image: Image.Image, max_size: int) -> Tuple[Image.Image, float]:
+        """
+        Resizes image if needed and returns the scale factor used.
+        Returns: (resized_image, scale_factor)
+        """
         w, h = image.size
         if max(w, h) > max_size:
             scale = max_size / max(w, h)
             new_w, new_h = int(w * scale), int(h * scale)
-            return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        return image
+            return image.resize((new_w, new_h), Image.Resampling.LANCZOS), scale
+        return image, 1.0
 
     @staticmethod
     def to_base64(image: Image.Image, fmt: str = "JPEG", quality: int = 85) -> str:
@@ -111,10 +105,10 @@ class ImageProcessor:
 
         if points is not None and len(points) > 0:
             draw = ImageDraw.Draw(result)
-            r = 5
+            r = 6
             for point, label in zip(points, labels):
                 x, y = point
-                color = "green" if label == 1 else "red"
+                color = "#10b981" if label == 1 else "#ef4444"
                 draw.ellipse((x-r, y-r, x+r, y+r), fill=color, outline="white", width=2)
                 
         return result
@@ -131,8 +125,7 @@ class ImageDecoders:
             pass
         return None
 
-# --- Zenoh Logic ---
-
+# --- Zenoh Logic (Unchanged) ---
 class ZenohStreamer:
     def __init__(self):
         self.session = None
@@ -140,11 +133,8 @@ class ZenohStreamer:
         self.subscriber_pc = None
         self.publisher_mask = None
         self.publisher_action = None
-        
         self._latest_image = None
         self._latest_mask_pc = None
-        self._mask_pc_timestamp = 0
-        
         self._lock = threading.Lock()
         self._is_streaming = False
         self._init_session()
@@ -165,12 +155,10 @@ class ZenohStreamer:
         with self._lock:
             if self._is_streaming: return True
             if not self.session: self._init_session()
-
             camera_id = CONFIG['CAMERA_ID']
             rgb_topic = f"env/{camera_id}/rgb"
             mask_topic = f"env/{camera_id}/mask"
             pc_topic = f"env/{camera_id}/mask_pc"
-
             try:
                 self.subscriber_rgb = self.session.declare_subscriber(rgb_topic, self._on_image_update)
                 self.subscriber_pc = self.session.declare_subscriber(pc_topic, self._on_pc_update)
@@ -211,13 +199,11 @@ class ZenohStreamer:
     def _on_pc_update(self, sample):
         with self._lock:
             self._latest_mask_pc = sample.payload
-            self._mask_pc_timestamp = time.time()
             logger.info(f"Received Mask PC update. Bytes: {len(self._latest_mask_pc)}")
 
     def publish_mask(self, mask_arr: np.ndarray):
         if not self.publisher_mask and self.session: self.start_stream()
         if not self.publisher_mask: return
-
         try:
             success, encoded_mask = cv2.imencode(".png", mask_arr)
             if success:
@@ -227,10 +213,7 @@ class ZenohStreamer:
                 out.channels = 1
                 out.format = "png"
                 out.data = encoded_mask.tobytes()
-                
-                with self._lock: 
-                    self._latest_mask_pc = None 
-                
+                with self._lock: self._latest_mask_pc = None 
                 self.publisher_mask.put(out.SerializeToString())
                 logger.info(f"Mask published to Zenoh.")
         except Exception as e:
@@ -239,9 +222,7 @@ class ZenohStreamer:
     async def wait_and_publish_action(self, timeout=5.0):
         start_time = time.time()
         logger.info("Waiting for Mask Point Cloud from Environment...")
-        
         pc_data = None
-        # Async wait loop
         while time.time() - start_time < timeout:
             with self._lock:
                 if self._latest_mask_pc is not None:
@@ -249,15 +230,13 @@ class ZenohStreamer:
                     break
             await asyncio.sleep(0.1)
         
-        if pc_data is None:
-            return False, "Timeout waiting for Mask PC"
+        if pc_data is None: return False, "Timeout waiting for Mask PC"
 
         try:
             action_id = str(uuid.uuid4())
             goal = GraspGoal()
             goal.action_id = action_id
             goal.mask_pc = bytes(pc_data)
-            
             goal.initial_approach_pose.position.x = 0.3
             goal.initial_approach_pose.position.y = 0.0
             goal.initial_approach_pose.position.z = 0.28
@@ -265,7 +244,6 @@ class ZenohStreamer:
             goal.initial_approach_pose.quaternion.y = 0.229
             goal.initial_approach_pose.quaternion.z = 0
             goal.initial_approach_pose.quaternion.w = 0.973
-            
             goal.retract_pose.CopyFrom(goal.initial_approach_pose)
 
             if not self.publisher_action: self.start_stream()
@@ -285,7 +263,6 @@ class ZenohStreamer:
         if self.session: self.session.close()
 
 # --- SAM3 & Session Logic ---
-
 class SAM3ModelHandler:
     def __init__(self):
         self.device = CONFIG['DEVICE']
@@ -333,16 +310,17 @@ class SAM3ModelHandler:
 
 class SessionManager:
     def __init__(self):
+        self.reset()
+
+    def reset(self):
         self.current_image = None
-        self.inference_state = None
+        self.release_inference()
         self.current_mask = None
         self.current_overlay = None
-        
-        # External Mode State
         self.external_mask_buffer = None
         self.external_mask_locked = False
         self.mask_source_mode = None 
-    
+
     def set_image(self, image: Image.Image, inference_state):
         self.release_inference() 
         self.current_image = image
@@ -354,7 +332,7 @@ class SessionManager:
         self.mask_source_mode = None
 
     def release_inference(self):
-        if self.inference_state and hasattr(self.inference_state, 'clear'):
+        if hasattr(self, 'inference_state') and self.inference_state and hasattr(self.inference_state, 'clear'):
             try: self.inference_state.clear()
             except: pass
         self.inference_state = None
@@ -364,12 +342,33 @@ app = FastAPI(title="SAM3 Robot Teleop")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="compute/third_party/grasp_gui/templates")
 
-os.makedirs(CONFIG['UPLOAD_FOLDER'], exist_ok=True)
-
 # Initialize Global Handlers
 model_handler = SAM3ModelHandler()
 session_manager = SessionManager()
 zenoh_streamer = ZenohStreamer()
+
+zenoh_streamer.start_stream()
+
+# --- Helper for Synchronization ---
+def _capture_and_encode_latest_frame() -> float:
+    """
+    Grabs the absolute latest frame, resizes it for SAM3,
+    and updates session state.
+    Returns: The scale factor (Processed / Original)
+    """
+    latest_img = zenoh_streamer.get_latest_frame()
+    if latest_img is None:
+        raise ValueError("No video stream frame available yet.")
+    
+    # Process and get Scale Factor
+    processed_img, scale_factor = ImageProcessor.resize_if_needed(latest_img, CONFIG['MAX_IMAGE_SIZE'])
+    
+    logger.info(f"Encoding new frame. Scale Factor: {scale_factor:.3f}")
+    
+    inf_state = model_handler.get_inference_state(processed_img)
+    session_manager.set_image(processed_img, inf_state)
+    
+    return scale_factor
 
 # --- Endpoints ---
 
@@ -377,71 +376,51 @@ zenoh_streamer = ZenohStreamer()
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-@app.post("/start_video")
-async def start_video():
-    success = zenoh_streamer.start_stream()
-    return {"success": success}
-
-@app.post("/stop_video")
-async def stop_video():
-    zenoh_streamer.stop_stream()
-    return {"success": True}
-
 @app.get("/get_frame")
 def get_frame():
-    """Returns the latest frame. Kept as def to run in threadpool if encoding is slow."""
-    if not zenoh_streamer.is_active():
-        return {"success": False, "status": "stopped"}
+    if session_manager.current_overlay:
+         return {
+            "success": True, 
+            "status": "overlay", 
+            "frame_data": ImageProcessor.to_base64(session_manager.current_overlay, "PNG")
+        }
+
     img = zenoh_streamer.get_latest_frame()
     if not img:
         return {"success": True, "status": "waiting"}
+    
     return {
         "success": True, 
         "status": "streaming", 
-        "frame_data": ImageProcessor.to_base64(img)
+        "frame_data": ImageProcessor.to_base64(img, "JPEG", quality=80)
     }
 
-@app.post("/upload")
-async def upload_image(image: UploadFile = File(...)):
-    if not image:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-    try:
-        content = await image.read()
-        pil_image = Image.open(io.BytesIO(content)).convert("RGB")
-        pil_image = ImageProcessor.resize_if_needed(pil_image, CONFIG['MAX_IMAGE_SIZE'])
-        
-        # NOTE: Model inference is CPU/GPU intensive.
-        # We run this synchronously here, which blocks a thread in the pool.
-        inf_state = model_handler.get_inference_state(pil_image)
-        
-        session_manager.set_image(pil_image, inf_state)
-        
-        return {"success": True, "image_data": ImageProcessor.to_base64(pil_image)}
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+@app.post("/reset")
+async def reset_session():
+    session_manager.reset()
+    return {"success": True}
 
 @app.post("/predict_mask")
 def predict_mask(data: PointsData):
-    """
-    Standard 'def' is used here because model prediction is CPU/GPU intensive.
-    FastAPI will run this in a threadpool to avoid blocking the event loop.
-    """
     if not data.points:
-        return JSONResponse(status_code=400, content={"error": "No points"})
-
-    if session_manager.inference_state is None:
-        # Recovery mechanism
-        if session_manager.current_image:
-             inf_state = model_handler.get_inference_state(session_manager.current_image)
-             session_manager.inference_state = inf_state
-        else:
-            return JSONResponse(status_code=400, content={"error": "No image context"})
+        return JSONResponse(status_code=400, content={"error": "No points provided"})
 
     try:
+        # 1. Capture & Resize
+        # Returns the scale factor needed to map Frontend Points -> Backend Processed Image
+        scale_factor = _capture_and_encode_latest_frame()
+
+        # 2. Scale Points
         points_arr = np.array(data.points)
+        
+        # Apply scaling if resizing happened
+        if scale_factor != 1.0:
+            points_arr = points_arr * scale_factor
+            logger.info(f"Scaled points by {scale_factor}")
+
         labels_arr = np.array(data.labels)
         
+        # 3. Predict
         masks, scores = model_handler.predict(session_manager.inference_state, points_arr, labels_arr)
         
         best_mask = masks[0]
@@ -455,34 +434,25 @@ def predict_mask(data: PointsData):
         )
         session_manager.current_overlay = overlay_img
 
-        return {
-            "success": True,
-            "overlay_data": ImageProcessor.to_base64(overlay_img, "PNG")
-        }
+        return {"success": True}
+
     except Exception as e:
         logger.error(f"Prediction Error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# --- External Mode Endpoints ---
-
-@app.get("/external/health")
-async def external_health():
-    target_url = CONFIG['EXTERNAL_SERVICE_URL']
-    try:
-        # Use asyncio-compatible request or threadpool wrapper
-        # Using run_in_executor to avoid blocking async loop with sync requests
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, requests.get, target_url, {'timeout': 2})
-        return {"status": "online", "url": target_url}
-    except Exception:
-        return {"status": "offline", "url": target_url}
-
 @app.post("/external/send_image")
 async def external_send_image():
-    if session_manager.current_image is None:
-        return JSONResponse(status_code=400, content={"error": "No image loaded"})
-
     try:
+        loop = asyncio.get_event_loop()
+        
+        # We assume external service handles the raw size, or we send resized? 
+        # Usually external vision models expect standard sizes, so we send the PROCESSED image from SessionManager.
+        # But wait, we must run capture first.
+        
+        # Capture & Encode (populate session_manager.current_image with RESIZED image)
+        await loop.run_in_executor(None, _capture_and_encode_latest_frame)
+
+        # Send the resized image to external service
         img_base64 = ImageProcessor.to_base64(session_manager.current_image, "PNG")
         payload = {
             'image': img_base64,
@@ -494,55 +464,49 @@ async def external_send_image():
         session_manager.external_mask_locked = False
         session_manager.mask_source_mode = 'external'
 
-        # Run sync request in threadpool
-        loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None, 
             lambda: requests.post(CONFIG['EXTERNAL_SERVICE_URL'], json=payload, timeout=10)
         )
         response.raise_for_status()
 
-        return {
-            "success": True,
-            "status_code": response.status_code,
-            "message": "Image sent to external service"
-        }
-    except requests.exceptions.Timeout:
-        return JSONResponse(status_code=504, content={"error": "Request timeout"})
+        return {"success": True}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Failed: {str(e)}"})
+
+@app.get("/external/health")
+async def external_health():
+    target_url = CONFIG['EXTERNAL_SERVICE_URL']
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, requests.get, target_url, {'timeout': 2})
+        return {"status": "online", "url": target_url}
+    except Exception:
+        return {"status": "offline", "url": target_url}
 
 @app.post("/external/receive_mask")
 async def external_receive_mask_post(data: ExternalMaskData):
     if session_manager.current_image is None:
         return JSONResponse(status_code=400, content={"error": "No image loaded"})
-    
     if session_manager.external_mask_locked:
         return {"success": False, "message": "Mask already confirmed."}
-
     try:
         mask_data = data.mask_data
         mask_img = ImageProcessor.from_base64(mask_data).convert('L')
-        
         if mask_img.size != session_manager.current_image.size:
             mask_img = mask_img.resize(session_manager.current_image.size, Image.Resampling.NEAREST)
-        
         mask_array = np.array(mask_img, dtype=np.uint8)
         session_manager.external_mask_buffer = np.clip(mask_array, 0, 255)
-        
         return {"success": True, "message": "Mask stored in buffer"}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Failed to process mask: {str(e)}"})
 
 @app.get("/external/receive_mask")
 def external_receive_mask_get(confirm: bool = False):
-    """GET endpoint to preview or confirm mask."""
     if session_manager.current_image is None:
-        return JSONResponse(status_code=400, content={"error": "No image loaded"})
-
+        return JSONResponse(status_code=400, content={"error": "No image captured yet."})
     if session_manager.external_mask_buffer is None:
         return JSONResponse(status_code=400, content={"error": "No mask in buffer."})
-
     try:
         mask_buffer = session_manager.external_mask_buffer
         overlay_img = ImageProcessor.create_overlay(session_manager.current_image, mask_buffer)
@@ -552,44 +516,29 @@ def external_receive_mask_get(confirm: bool = False):
             session_manager.current_overlay = overlay_img
             session_manager.external_mask_locked = True
             session_manager.mask_source_mode = 'external'
-            
             zenoh_streamer.publish_mask(session_manager.current_mask)
-            
-            return {
-                "success": True,
-                "overlay_data": ImageProcessor.to_base64(overlay_img, "PNG"),
-                "locked": True
-            }
+            return {"success": True, "locked": True}
         else:
-            return {
-                "success": True,
-                "overlay_data": ImageProcessor.to_base64(overlay_img, "PNG"),
-                "preview": True
-            }
+            session_manager.current_overlay = overlay_img
+            return {"success": True, "preview": True}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-# --- Execution Endpoints ---
 
 @app.post("/execute_grasp")
 async def execute_grasp():
     if session_manager.current_mask is None:
         return JSONResponse(status_code=400, content={"error": "No mask generated yet."})
-
-    # Await the async version of wait_and_publish
     success, result = await zenoh_streamer.wait_and_publish_action(timeout=5.0)
-    
     if success:
+        session_manager.current_overlay = None
         return {"success": True, "action_id": result, "message": "Grasp command sent!"}
     else:
         return JSONResponse(status_code=504, content={"error": result})
 
 @app.post("/select_place")
 async def select_place(data: PlaceData):
-    # Logic to store place location can go here
     return {"success": True}
 
-# --- Signal Handling & Runner ---
 def signal_handler(sig, frame):
     zenoh_streamer.close()
     sys.exit(0)
@@ -597,6 +546,5 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == '__main__':
-    
-    # Workers=1 because we rely on global state objects (Zenoh/SAM3 Model)
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=50052, workers=1)
