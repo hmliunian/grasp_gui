@@ -17,11 +17,31 @@
         }
         .header {
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            padding: 20px;
-            text-align: center;
+            padding: 15px 25px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
         }
-        .header h1 { color: #fff; font-size: 24px; }
+        .header h1 { color: #fff; font-size: 22px; margin: 0; }
+        
+        /* Status Badge */
+        .status-badge {
+            font-size: 12px;
+            padding: 5px 10px;
+            border-radius: 20px;
+            background: #333;
+            color: #888;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #666; }
+        .status-online .status-dot { background: #10b981; box-shadow: 0 0 8px #10b981; }
+        .status-online { color: #10b981; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); }
+        .status-offline .status-dot { background: #ef4444; }
+        .status-offline { color: #ef4444; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); }
+
         .main-container {
             display: flex;
             flex: 1;
@@ -59,6 +79,7 @@
             display: flex;
             flex-direction: column;
             gap: 12px;
+            height: fit-content;
         }
         .step-button {
             width: 100%;
@@ -68,10 +89,15 @@
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            transition: transform 0.2s, opacity 0.2s;
+            transition: all 0.2s;
             color: white;
             text-transform: uppercase;
             box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
         }
         .step-button:disabled {
             opacity: 0.3;
@@ -79,16 +105,30 @@
             transform: none !important;
             box-shadow: none;
         }
-        .step-button:not(:disabled):hover { transform: translateY(-2px); }
+        .step-button:not(:disabled):hover { transform: translateY(-2px); filter: brightness(1.1); }
         
-        .step-1 { background: #3b82f6; } /* Blue */
-        .step-2 { background: #ef4444; } /* Red */
-        .step-3 { background: #8b5cf6; } /* Purple */
-        .step-4 { background: #10b981; } /* Green */
-        .step-5 { background: #f59e0b; } /* Orange */
-        .step-6 { background: #ec4899; } /* Pink/Magenta for Action */
+        /* Colors */
+        .step-1 { background: #3b82f6; } 
+        .step-2 { background: #ef4444; } 
+        .step-3 { background: #8b5cf6; } 
+        .step-4 { background: #10b981; } 
+        .step-5 { background: #f59e0b; } 
+        .step-6 { background: #ec4899; } 
+        
+        .step-ext-send { background: #0ea5e9; }
+        .step-ext-confirm { background: #059669; border: 1px solid #34d399; }
 
-        .loading {
+        /* External Section Container */
+        .external-panel {
+            background: rgba(255,255,255,0.05);
+            border: 1px dashed #444;
+            border-radius: 8px;
+            padding: 10px;
+            margin: 5px 0;
+        }
+        .external-panel h3 { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 1px; }
+
+        .loading-overlay {
             position: absolute;
             top: 50%; left: 50%;
             transform: translate(-50%, -50%);
@@ -99,6 +139,7 @@
             z-index: 100;
             text-align: center;
             border: 1px solid #333;
+            min-width: 200px;
         }
         .spinner {
             width: 30px; height: 30px;
@@ -110,7 +151,6 @@
         }
         @keyframes spin { 100% { transform: rotate(360deg); } }
 
-        /* Helpers */
         .mode-selector { display: flex; gap: 10px; margin-bottom: 5px; }
         .mode-btn { 
             flex: 1; padding: 10px; border: 1px solid #444; 
@@ -120,18 +160,24 @@
         .mode-btn.active.positive { background: #10b981; color: white; border-color: #10b981; }
         .mode-btn.active.negative { background: #ef4444; color: white; border-color: #ef4444; }
         
-        .download-row { display: flex; gap: 8px; margin-top: 10px; border-top: 1px solid #333; padding-top: 15px; }
-        .download-btn { 
-            flex: 1; padding: 8px; background: #222; border: 1px solid #444; 
-            color: #aaa; cursor: pointer; border-radius: 6px; font-size: 12px;
+        .separator { 
+            text-align: center; color: #555; font-size: 11px; margin: 10px 0; 
+            position: relative; 
         }
-        .download-btn:hover { background: #333; color: white; }
-        .section-label { font-size: 12px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-top: 5px;}
+        .separator::before, .separator::after {
+            content: ""; position: absolute; top: 50%; width: 40%; height: 1px; background: #333;
+        }
+        .separator::before { left: 0; }
+        .separator::after { right: 0; }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>🎯 SAM3 Robot Teleop</h1>
+        <div id="extServiceStatus" class="status-badge">
+            <div class="status-dot"></div>
+            <span id="extStatusText">Checking Service...</span>
+        </div>
     </div>
 
     <div class="main-container">
@@ -139,53 +185,59 @@
             <div class="canvas-wrapper">
                 <canvas id="mainCanvas"></canvas>
             </div>
-            <div class="loading" id="loading">
+            <div class="loading-overlay" id="loading">
                 <div class="spinner"></div>
                 <div id="loadingText">Processing...</div>
+                <div id="loadingSubText" style="font-size: 12px; color: #888; margin-top: 5px;"></div>
             </div>
         </div>
 
         <div class="control-section">
-            <button class="step-button step-1" id="btnStartVideo">1. Start Stream</button>
+            <button class="step-button step-1" id="btnStartVideo">Start Stream</button>
+            <button class="step-button step-2" id="btnStopVideo" disabled>Stop & Capture</button>
 
-            <button class="step-button step-2" id="btnStopVideo" disabled>2. Stop & Capture</button>
-
-            <button class="step-button step-3" id="btnAddPoints" disabled>3. Annotate Points</button>
+            <button class="step-button step-3" id="btnAddPoints" disabled>Annotate Points</button>
             <div class="mode-selector" id="modeSelector" style="display: none;">
                 <button class="mode-btn positive active" id="btnPositive">Positive (+)</button>
                 <button class="mode-btn negative" id="btnNegative">Negative (-)</button>
             </div>
+            <button class="step-button step-4" id="btnGenerateMask" disabled>Segment (SAM3)</button>
 
-            <button class="step-button step-4" id="btnGenerateMask" disabled>4. Segment</button>
+            <div class="separator">OR USE EXTERNAL</div>
 
-            <button class="step-button step-5" id="btnSelectPlace" disabled>5. Select Place</button>
-
-            <button class="step-button step-6" id="btnExecuteGrasp" disabled>6. Execute Grasp</button>
-            
-            <div id="downloadOptions" style="display: none;">
-                <div class="section-label">Debug / Export</div>
-                <div class="download-row">
-                    <button class="download-btn" id="dlOverlay">Save Overlay</button>
-                    <button class="download-btn" id="dlMask">Save Mask</button>
-                </div>
+            <div class="external-panel">
+                <h3>External Model</h3>
+                <button class="step-button step-ext-send" id="btnSendExternal" disabled>
+                    Send to External
+                </button>
+                <button class="step-button step-ext-confirm" id="btnConfirmExternal" style="display:none; margin-top:10px;">
+                    Confirm Mask
+                </button>
             </div>
+
+            <div class="separator">ACTION</div>
+
+            <button class="step-button step-5" id="btnSelectPlace" disabled>Select Place</button>
+            <button class="step-button step-6" id="btnExecuteGrasp" disabled>Execute Grasp</button>
         </div>
     </div>
 
     <script>
-        // State
+        // --- State Management ---
         const state = {
             step: 0,
             pollingInterval: null,
-            canvasScale: 1,
+            maskPollingInterval: null,
             points: [],
             labels: [],
             currentMode: 'positive',
             currentImage: null, 
-            currentOverlay: null
+            currentOverlay: null,
+            maskSource: null, // 'sam3' or 'external'
+            externalServiceOnline: false
         };
 
-        // Elements
+        // --- Elements ---
         const canvas = document.getElementById('mainCanvas');
         const ctx = canvas.getContext('2d');
         const loading = document.getElementById('loading');
@@ -196,97 +248,96 @@
             stop: document.getElementById('btnStopVideo'),
             points: document.getElementById('btnAddPoints'),
             mask: document.getElementById('btnGenerateMask'),
+            sendExt: document.getElementById('btnSendExternal'),
+            confirmExt: document.getElementById('btnConfirmExternal'),
             place: document.getElementById('btnSelectPlace'),
-            execute: document.getElementById('btnExecuteGrasp'), // Changed from Download
+            execute: document.getElementById('btnExecuteGrasp'),
             pos: document.getElementById('btnPositive'),
             neg: document.getElementById('btnNegative')
         };
 
-        // Init Canvas
+        // --- Init ---
         canvas.width = 640;
         canvas.height = 480;
-        ctx.fillStyle = "#111";
-        ctx.fillRect(0,0,640,480);
-        ctx.fillStyle = "#555";
-        ctx.font = "20px Arial";
-        ctx.textAlign = "center";
-        ctx.fillText("Ready", 320, 240);
+        drawPlaceholder();
+        checkExternalHealth();
 
-        // --- Step 1: Start Video (Polling Logic) ---
+        // --- Health Check ---
+        async function checkExternalHealth() {
+            const badge = document.getElementById('extServiceStatus');
+            const text = document.getElementById('extStatusText');
+            try {
+                const res = await fetch('/external/health');
+                const data = await res.json();
+                if (data.status === 'online') {
+                    badge.className = 'status-badge status-online';
+                    text.innerText = "External Service Online";
+                    state.externalServiceOnline = true;
+                } else {
+                    throw new Error('Offline');
+                }
+            } catch (e) {
+                badge.className = 'status-badge status-offline';
+                text.innerText = "External Service Offline";
+                state.externalServiceOnline = false;
+            }
+        }
+
+        // --- 1. Video Streaming ---
         btns.start.addEventListener('click', async () => {
             setLoading(true, "Starting Stream...");
             try {
                 const res = await fetch('/start_video', { method: 'POST' });
                 const data = await res.json();
-                
                 if (data.success) {
                     state.step = 1;
                     updateUI();
-                    
                     if (state.pollingInterval) clearInterval(state.pollingInterval);
-                    
-                    state.pollingInterval = setInterval(async () => {
-                        try {
-                            const frameRes = await fetch('/get_frame');
-                            const frameData = await frameRes.json();
-                            
-                            if (frameData.success && frameData.frame_data) {
-                                renderImage(frameData.frame_data);
-                            }
-                        } catch (e) {
-                            console.error("Polling error", e);
-                        }
-                    }, 40); 
+                    state.pollingInterval = setInterval(pollVideoFrame, 40); 
                 }
-            } catch (e) {
-                alert("Failed to start stream");
-            } finally {
-                setLoading(false);
-            }
+            } catch (e) { alert("Stream failed"); } 
+            finally { setLoading(false); }
         });
 
-        // --- Step 2: Stop Video (Capture & Upload) ---
+        async function pollVideoFrame() {
+            try {
+                const res = await fetch('/get_frame');
+                const data = await res.json();
+                if (data.success && data.frame_data) renderImage(data.frame_data);
+            } catch (e) { console.error(e); }
+        }
+
+        // --- 2. Stop & Capture ---
         btns.stop.addEventListener('click', async () => {
-            if (state.pollingInterval) clearInterval(state.pollingInterval);
-            state.pollingInterval = null;
-
-            setLoading(true, "Capturing & Loading Model...");
-
+            clearInterval(state.pollingInterval);
+            setLoading(true, "Capturing & Encoding...");
+            
             try {
                 await fetch('/stop_video', { method: 'POST' });
-
+                
                 canvas.toBlob(async (blob) => {
-                    if (!blob) {
-                        alert("Canvas empty!"); 
-                        setLoading(false); 
-                        return;
-                    }
-
                     const formData = new FormData();
                     formData.append('image', blob, 'capture.jpg');
-
-                    const upRes = await fetch('/upload', { method: 'POST', body: formData });
-                    const upData = await upRes.json();
-
-                    if (upData.success) {
-                        state.currentImage = upData.image_data;
+                    
+                    const res = await fetch('/upload', { method: 'POST', body: formData });
+                    const data = await res.json();
+                    
+                    if (data.success) {
+                        state.currentImage = data.image_data;
+                        state.points = []; state.labels = [];
+                        state.currentOverlay = null; state.maskSource = null;
                         renderImage(state.currentImage);
                         state.step = 2;
                         updateUI();
-                    } else {
-                        alert("Capture failed: " + upData.error);
                     }
                     setLoading(false);
                 }, 'image/jpeg', 0.95);
-
-            } catch (e) {
-                console.error(e);
-                alert("Error stopping stream");
-                setLoading(false);
+            } catch (e) { 
+                alert("Capture error"); setLoading(false); 
             }
         });
 
-        // --- Step 3: Points ---
+        // --- 3. Annotation (SAM3) ---
         btns.points.addEventListener('click', () => {
             state.step = 3;
             document.getElementById('modeSelector').style.display = 'flex';
@@ -294,23 +345,17 @@
         });
 
         canvas.addEventListener('mousedown', (e) => {
-            if (state.step < 3) return;
+            if (state.step !== 3 && state.step !== 5) return;
             
             const rect = canvas.getBoundingClientRect();
             const scaleX = canvas.width / rect.width;
             const scaleY = canvas.height / rect.height;
-
             const x = (e.clientX - rect.left) * scaleX;
             const y = (e.clientY - rect.top) * scaleY;
 
-            // Step 3: Add Annotation Points
             if (state.step === 3) {
-                const clickedIndex = state.points.findIndex(p => {
-                    const dx = p[0] - x;
-                    const dy = p[1] - y;
-                    return Math.sqrt(dx*dx + dy*dy) < 15;
-                });
-
+                // Add/Remove Point Logic
+                const clickedIndex = state.points.findIndex(p => Math.hypot(p[0]-x, p[1]-y) < 15);
                 if (clickedIndex >= 0) {
                     state.points.splice(clickedIndex, 1);
                     state.labels.splice(clickedIndex, 1);
@@ -319,19 +364,14 @@
                     state.labels.push(state.currentMode === 'positive' ? 1 : 0);
                 }
                 redrawCanvas();
-            }
-
-            // Step 5: Select Place Region
-            if (state.step === 5) {
+                updateUI();
+            } else if (state.step === 5) {
                 handlePlaceSelection(x, y);
             }
         });
 
-        // --- Step 4: Generate Mask ---
         btns.mask.addEventListener('click', async () => {
-            if (state.points.length === 0) return alert("Add points first!");
-            setLoading(true, "Segmenting...");
-            
+            setLoading(true, "Running SAM3...");
             try {
                 const res = await fetch('/predict_mask', {
                     method: 'POST',
@@ -339,168 +379,177 @@
                     body: JSON.stringify({ points: state.points, labels: state.labels })
                 });
                 const data = await res.json();
-                
                 if (data.success) {
                     state.currentOverlay = data.overlay_data;
-                    renderImage(data.overlay_data);
+                    state.maskSource = 'sam3';
                     state.step = 4;
-                    updateUI();
-                } else {
-                    alert("Error: " + data.error);
-                }
-            } catch (e) {
-                alert("Segmentation failed");
-            } finally {
-                setLoading(false);
-            }
-        });
-
-        // --- Step 5: Place Selection ---
-        btns.place.addEventListener('click', () => {
-            state.step = 5;
-            updateUI();
-        });
-
-        async function handlePlaceSelection(x, y) {
-            setLoading(true, "Recording Place Location...");
-            try {
-                const res = await fetch('/select_place', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ x: x, y: y })
-                });
-                const data = await res.json();
-                if (data.success) {
                     redrawCanvas();
-                    ctx.strokeStyle = "yellow";
-                    ctx.lineWidth = 3;
-                    ctx.strokeRect(x - 5, y - 5, 10, 10);
-                    state.step = 6; 
                     updateUI();
                 }
-            } catch(e) {
-                console.error(e);
-            } finally {
+            } catch (e) { alert("Segmentation failed"); }
+            finally { setLoading(false); }
+        });
+
+        // --- 4. External Auto-Segment ---
+        btns.sendExt.addEventListener('click', async () => {
+            setLoading(true, "Sending to External...", "Please wait...");
+            try {
+                // 1. Send Image
+                const sendRes = await fetch('/external/send_image', { method: 'POST' });
+                if (!sendRes.ok) throw new Error("Failed to send image");
+                
+                // 2. Start Polling for Result
+                setLoading(true, "Waiting for External Mask...", "Polling...");
+                startMaskPolling();
+            } catch (e) {
+                alert("Error: " + e.message);
                 setLoading(false);
             }
+        });
+
+        function startMaskPolling() {
+            let attempts = 0;
+            const maxAttempts = 60; // 30 seconds (500ms * 60)
+            
+            if (state.maskPollingInterval) clearInterval(state.maskPollingInterval);
+            
+            state.maskPollingInterval = setInterval(async () => {
+                attempts++;
+                try {
+                    // Check for preview (confirm=false)
+                    const res = await fetch('/external/receive_mask?confirm=false');
+                    const data = await res.json();
+                    
+                    if (data.success && data.overlay_data) {
+                        // Found it!
+                        clearInterval(state.maskPollingInterval);
+                        state.currentOverlay = data.overlay_data;
+                        redrawCanvas();
+                        
+                        // Switch UI to confirmation mode
+                        btns.sendExt.style.display = 'none';
+                        btns.confirmExt.style.display = 'block';
+                        btns.confirmExt.innerText = "Confirm External Mask";
+                        setLoading(false);
+                    } else if (attempts >= maxAttempts) {
+                        clearInterval(state.maskPollingInterval);
+                        setLoading(false);
+                        alert("Timed out waiting for external mask.");
+                    }
+                } catch (e) {
+                    console.warn("Polling error", e);
+                }
+            }, 500);
         }
 
-        // --- Step 6: Execute Grasp (Changed from Download) ---
-        btns.execute.addEventListener('click', async () => {
-            // Note: We show a specific message because backend waits for PC
-            setLoading(true, "Syncing with Env & Sending Action...");
-            
+        btns.confirmExt.addEventListener('click', async () => {
+            setLoading(true, "Finalizing Mask...");
             try {
-                const res = await fetch('/execute_grasp', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'}
-                });
+                const res = await fetch('/external/receive_mask?confirm=true');
                 const data = await res.json();
-                
                 if (data.success) {
-                    alert(`✅ Command Sent!\nAction ID: ${data.action_id}`);
-                } else {
-                    alert(`❌ Failed: ${data.error}`);
+                    state.maskSource = 'external';
+                    state.step = 4;
+                    updateUI();
                 }
-            } catch (e) {
-                alert("Network Error during execution request.");
-            } finally {
-                setLoading(false);
-            }
+            } catch (e) { alert("Confirmation failed"); }
+            finally { setLoading(false); }
         });
 
+        // --- 5 & 6. Place & Execute ---
+        btns.place.addEventListener('click', () => { state.step = 5; updateUI(); });
+
+        async function handlePlaceSelection(x, y) {
+            setLoading(true, "Recording Target...");
+            try {
+                await fetch('/select_place', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ x, y })
+                });
+                state.step = 6;
+                redrawCanvas();
+                // Draw selection box
+                ctx.strokeStyle = "yellow"; ctx.lineWidth = 3;
+                ctx.strokeRect(x-10, y-10, 20, 20);
+                updateUI();
+            } finally { setLoading(false); }
+        }
+
+        btns.execute.addEventListener('click', async () => {
+            setLoading(true, "Calculating 3D Grasp...", "Syncing with Point Cloud...");
+            try {
+                const res = await fetch('/execute_grasp', { method: 'POST' });
+                const data = await res.json();
+                if (data.success) alert(`✅ Command Sent!\nID: ${data.action_id}`);
+                else alert(`❌ Failed: ${data.error}`);
+            } catch (e) { alert("Execution Network Error"); }
+            finally { setLoading(false); }
+        });
 
         // --- Helpers ---
-
-        function renderImage(base64Str) {
+        function renderImage(b64) {
             const img = new Image();
             img.onload = () => {
-                if (canvas.width !== img.width || canvas.height !== img.height) {
-                    canvas.width = img.width;
-                    canvas.height = img.height;
-                }
+                canvas.width = img.width; canvas.height = img.height;
                 ctx.drawImage(img, 0, 0);
-                if (state.step >= 3) drawPoints();
+                if (state.step >= 3 && !state.maskSource) drawPoints();
             };
-            img.src = base64Str;
+            img.src = b64;
         }
 
         function redrawCanvas() {
-            const src = (state.step >= 4 && state.currentOverlay) ? state.currentOverlay : state.currentImage;
+            const src = (state.step >= 4 || (state.currentOverlay && btns.confirmExt.offsetParent !== null)) 
+                ? state.currentOverlay : state.currentImage;
             if (src) renderImage(src);
         }
 
         function drawPoints() {
             state.points.forEach((p, i) => {
-                ctx.beginPath();
-                ctx.arc(p[0], p[1], 5, 0, Math.PI * 2);
-                ctx.fillStyle = state.labels[i] === 1 ? '#10b981' : '#ef4444'; 
-                ctx.fill();
-                ctx.strokeStyle = 'white';
-                ctx.stroke();
+                ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, Math.PI*2);
+                ctx.fillStyle = state.labels[i] === 1 ? '#10b981' : '#ef4444';
+                ctx.fill(); ctx.stroke();
             });
+        }
+
+        function drawPlaceholder() {
+            ctx.fillStyle = "#111"; ctx.fillRect(0,0,640,480);
+            ctx.fillStyle = "#555"; ctx.font = "20px Arial";
+            ctx.textAlign = "center"; ctx.fillText("Ready", 320, 240);
         }
 
         function updateUI() {
-            Object.values(btns).forEach(b => b.disabled = true);
+            // Reset External Button State
+            if (state.step <= 2) {
+                btns.sendExt.style.display = 'block';
+                btns.confirmExt.style.display = 'none';
+            }
+
+            // Button Enable/Disable Logic
+            btns.stop.disabled = (state.step !== 1);
+            btns.start.disabled = (state.step === 1);
             
-            if (state.step === 0 || state.step >= 2) btns.start.disabled = false;
-            if (state.step === 1) btns.stop.disabled = false;
-            if (state.step >= 2) btns.points.disabled = false;
-            if (state.step >= 3 && state.points.length > 0) btns.mask.disabled = false;
-            if (state.step >= 4) btns.place.disabled = false;
-            if (state.step >= 4) btns.execute.disabled = false; // Enable action after mask/place
+            const hasImage = state.step >= 2;
+            btns.points.disabled = !hasImage;
+            btns.sendExt.disabled = !(hasImage && state.externalServiceOnline);
+            
+            const hasPoints = state.points.length > 0;
+            btns.mask.disabled = !(state.step === 3 && hasPoints);
 
-            btns.pos.disabled = false;
-            btns.neg.disabled = false;
-
-            // Show Debug options only after mask is generated
-            const dlRow = document.getElementById('downloadOptions');
-            dlRow.style.display = (state.step >= 4) ? 'block' : 'none';
+            const maskReady = state.step >= 4;
+            btns.place.disabled = !maskReady;
+            btns.execute.disabled = !maskReady; // Can execute immediately if no place needed
         }
 
-        function setLoading(isActive, text="Processing...") {
-            loading.style.display = isActive ? 'block' : 'none';
+        function setLoading(active, text="Processing...", subtext="") {
+            loading.style.display = active ? 'block' : 'none';
             document.getElementById('loadingText').innerText = text;
+            document.getElementById('loadingSubText').innerText = subtext;
         }
 
         // Mode Toggles
-        btns.pos.onclick = () => {
-            state.currentMode = 'positive';
-            btns.pos.classList.add('active');
-            btns.neg.classList.remove('active');
-        };
-        btns.neg.onclick = () => {
-            state.currentMode = 'negative';
-            btns.neg.classList.add('active');
-            btns.pos.classList.remove('active');
-        };
-
-        // Legacy Downloads
-        document.getElementById('dlOverlay').onclick = () => download('overlay');
-        document.getElementById('dlMask').onclick = () => download('mask');
-
-        async function download(type) {
-            const res = await fetch('/download', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ type })
-            });
-            if (res.ok) {
-                const blob = await res.blob();
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = type + '.png';
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-            } else {
-                alert("Download failed");
-            }
-        }
-
-        updateUI();
+        btns.pos.onclick = () => { state.currentMode='positive'; btns.pos.classList.add('active'); btns.neg.classList.remove('active'); };
+        btns.neg.onclick = () => { state.currentMode='negative'; btns.neg.classList.add('active'); btns.pos.classList.remove('active'); };
     </script>
 </body>
 </html>
