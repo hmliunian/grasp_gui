@@ -25,6 +25,7 @@
         .header-instructions { font-size: 13px; color: #aaa; margin-top: 4px; }
         .highlight-pos { color: #10b981; font-weight: bold; }
         .highlight-neg { color: #ef4444; font-weight: bold; }
+        .highlight-place { color: #3b82f6; font-weight: bold; }
 
         .header-right { display: flex; align-items: center; gap: 15px; }
 
@@ -56,7 +57,11 @@
         .canvas-wrapper {
             background: #1a1a1a; border-radius: 12px; padding: 10px; 
             box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6); display: inline-block;
+            border: 2px solid transparent; transition: border-color 0.3s;
         }
+        /* Visual cue for Place Mode */
+        .canvas-wrapper.place-mode { border-color: #3b82f6; cursor: crosshair; }
+
         #mainCanvas {
             max-width: 100%; max-height: 80vh; border-radius: 4px; 
             cursor: crosshair; display: block; background: #000;
@@ -69,6 +74,7 @@
             width: 100%; padding: 15px; border: none; border-radius: 8px; 
             font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; 
             color: white; text-transform: uppercase; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            display: flex; align-items: center; justify-content: center; gap: 8px;
         }
         .step-button:disabled { opacity: 0.3; cursor: not-allowed; transform: none !important; box-shadow: none; }
         .step-button:not(:disabled):hover { transform: translateY(-2px); filter: brightness(1.1); }
@@ -91,7 +97,7 @@
         @keyframes spin { 100% { transform: rotate(360deg); } }
 
         .separator { text-align: center; color: #555; font-size: 11px; margin: 10px 0; position: relative; }
-        .separator::before, .separator::after { content: ""; position: absolute; top: 50%; width: 40%; height: 1px; background: #333; }
+        .separator::before, .separator::after { content: ""; position: absolute; top: 50%; width: 35%; height: 1px; background: #333; }
         .separator::before { left: 0; } .separator::after { right: 0; }
     </style>
 </head>
@@ -99,10 +105,8 @@
     <div class="header">
         <div class="header-left">
             <h1>🎯 SAM3 Live Teleop</h1>
-            <p class="header-instructions">
-                <span class="highlight-pos">L-Click: Add Pos</span> | 
-                <span class="highlight-neg">R-Click: Add Neg</span> | 
-                Dbl-Click: Remove
+            <p class="header-instructions" id="headerInstr">
+                1. Define Grasp: <span class="highlight-pos">L-Click (Add)</span> | <span class="highlight-neg">R-Click (Remove)</span>
             </p>
         </div>
         <div class="header-right">
@@ -110,7 +114,7 @@
                 <div class="status-dot"></div><span id="extStatusText">Checking...</span>
             </div>
             
-            <button class="btn-reset-icon" id="btnReset" title="Reset to Live Stream">
+            <button class="btn-reset-icon" id="btnReset" title="Reset Session">
                 <svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
             </button>
         </div>
@@ -118,7 +122,7 @@
 
     <div class="main-container">
         <div class="canvas-section">
-            <div class="canvas-wrapper">
+            <div class="canvas-wrapper" id="canvasWrapper">
                 <canvas id="mainCanvas" oncontextmenu="return false;"></canvas>
             </div>
             <div class="loading-overlay" id="loading">
@@ -129,9 +133,11 @@
         </div>
 
         <div class="control-section">
-            <button class="step-button step-sam" id="btnGenerateMask" disabled>Segment View (SAM3)</button>
+            <button class="step-button step-sam" id="btnGenerateMask" disabled>
+                <span>Generate Grasp Mask</span>
+            </button>
 
-            <div class="separator">OR USE EXTERNAL</div>
+            <div class="separator">OR EXTERNAL MASK</div>
 
             <div class="external-panel">
                 <h3>External Model</h3>
@@ -139,20 +145,30 @@
                 <button class="step-button step-ext-confirm" id="btnConfirmExternal" style="display:none; margin-top:10px;">Confirm Mask</button>
             </div>
 
-            <div class="separator">ACTION</div>
+            <div class="separator">GOAL & ACTION</div>
 
-            <button class="step-button step-place" id="btnSelectPlace" disabled>Select Place Goal</button>
-            <button class="step-button step-exec" id="btnExecuteGrasp" disabled>Execute Grasp</button>
+            <button class="step-button step-place" id="btnSelectPlace" disabled>
+                <span>Set Place Target</span>
+            </button>
+
+            <button class="step-button step-exec" id="btnExecuteGrasp" disabled>
+                <span>Execute Grasp</span>
+            </button>
         </div>
     </div>
 
     <script>
+        // State Machine: 
+        // 0 = Define Grasp (L/R Clicks)
+        // 1 = Grasp Generated (Waiting for next step)
+        // 2 = Define Place (Click sets target)
+        // 3 = Ready to Execute
         const state = {
             step: 0, 
             pollingInterval: null,
             maskPollingInterval: null,
-            points: [],
-            labels: [],
+            points: [], // Grasp Points
+            labels: [], // Grasp Labels
             externalServiceOnline: false,
             clickTimer: null
         };
@@ -160,6 +176,8 @@
         const canvas = document.getElementById('mainCanvas');
         const ctx = canvas.getContext('2d');
         const loading = document.getElementById('loading');
+        const wrapper = document.getElementById('canvasWrapper');
+        const headerInstr = document.getElementById('headerInstr');
         
         const btns = {
             mask: document.getElementById('btnGenerateMask'),
@@ -174,6 +192,8 @@
         drawPlaceholder("Waiting for video stream...");
         checkExternalHealth();
         state.pollingInterval = setInterval(pollVideoFrame, 50);
+
+        // --- Network / Polling ---
 
         async function checkExternalHealth() {
             const badge = document.getElementById('extServiceStatus');
@@ -206,6 +226,8 @@
             } catch (e) { console.error(e); }
         }
 
+        // --- Interaction Logic ---
+
         function getCanvasCoordinates(e) {
             const rect = canvas.getBoundingClientRect();
             return {
@@ -215,41 +237,58 @@
         }
 
         canvas.addEventListener('mousedown', (e) => {
-            if (state.step !== 0 && state.step !== 2) return;
             const coords = getCanvasCoordinates(e);
 
+            // MODE: PLACE SELECTION
             if (state.step === 2) {
                 handlePlaceSelection(coords.x, coords.y);
                 return;
             }
 
-            if (state.clickTimer === null) {
-                state.clickTimer = setTimeout(() => {
-                    state.clickTimer = null;
-                    const label = e.button === 2 ? 0 : 1; 
-                    state.points.push([coords.x, coords.y]);
-                    state.labels.push(label);
-                    if (lastFrameData) renderImage(lastFrameData);
-                    updateUI();
-                }, 250); 
+            // MODE: GRASP DEFINITION (Step 0)
+            if (state.step === 0) {
+                // Prevent duplicate clicks if spamming
+                if (state.clickTimer === null) {
+                    state.clickTimer = setTimeout(() => {
+                        state.clickTimer = null;
+                        // Left Click (0) = Label 1 (Positive)
+                        // Right Click (2) = Label 0 (Negative)
+                        const label = e.button === 2 ? 0 : 1; 
+                        state.points.push([coords.x, coords.y]);
+                        state.labels.push(label);
+                        if (lastFrameData) renderImage(lastFrameData);
+                        updateUI();
+                    }, 150); 
+                }
             }
         });
 
+        // Double Click to undo last point (Only in Grasp mode)
         canvas.addEventListener('dblclick', (e) => {
             if (state.step !== 0) return;
             clearTimeout(state.clickTimer); state.clickTimer = null;
             const coords = getCanvasCoordinates(e);
-            const clickedIndex = state.points.findIndex(p => Math.hypot(p[0]-coords.x, p[1]-coords.y) < 20);
-            if (clickedIndex >= 0) {
-                state.points.splice(clickedIndex, 1);
-                state.labels.splice(clickedIndex, 1);
+            // Find nearest point
+            let nearestIdx = -1;
+            let minDist = 30;
+            state.points.forEach((p, i) => {
+                const d = Math.hypot(p[0]-coords.x, p[1]-coords.y);
+                if (d < minDist) { minDist = d; nearestIdx = i; }
+            });
+
+            if (nearestIdx >= 0) {
+                state.points.splice(nearestIdx, 1);
+                state.labels.splice(nearestIdx, 1);
                 if (lastFrameData) renderImage(lastFrameData);
                 updateUI();
             }
         });
 
+        // --- Button Handlers ---
+
+        // 1. Generate Grasp Mask
         btns.mask.addEventListener('click', async () => {
-            setLoading(true, "Capturing & Segmenting...", "Freezing view...");
+            setLoading(true, "Refining Grasp...", "Running SAM3...");
             try {
                 const res = await fetch('/predict_mask', {
                     method: 'POST',
@@ -258,15 +297,40 @@
                 });
                 const data = await res.json();
                 if (data.success) {
-                    state.step = 1; 
+                    state.step = 1; // Grasp Done, Ready for Place
                     updateUI();
                 } else throw new Error(data.error);
             } catch (e) { alert("Error: " + e.message); }
             finally { setLoading(false); }
         });
 
+        // 2. Select Place (Enter Mode)
+        btns.place.addEventListener('click', () => { 
+            state.step = 2; // Enter Place Mode
+            updateUI(); 
+        });
+
+        async function handlePlaceSelection(x, y) {
+            setLoading(true, "Generating Goal Mask...", "Click to update if needed");
+            try {
+                const res = await fetch('/select_place', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ x, y })
+                });
+                const data = await res.json();
+                if(data.success) {
+                    state.step = 3; // Ready to Execute (but stays clickable to update place)
+                    // We don't need to manually draw; backend updates overlay with Blue mask
+                    updateUI();
+                }
+            } catch(e) { console.error(e); } 
+            finally { setLoading(false); }
+        }
+
+        // 3. External Logic
         btns.sendExt.addEventListener('click', async () => {
-            setLoading(true, "Sending...", "Freezing view...");
+            setLoading(true, "Sending to External...", "Freezing view...");
             try {
                 const sendRes = await fetch('/external/send_image', { method: 'POST' });
                 if (!sendRes.ok) throw new Error("Failed to send");
@@ -285,62 +349,61 @@
                     const data = await res.json();
                     if (data.success && data.preview) {
                         clearInterval(state.maskPollingInterval);
-                        state.step = 1; 
+                        state.step = 1; // Treat as if Grasp is generated
                         btns.sendExt.style.display = 'none';
                         btns.confirmExt.style.display = 'block';
                         setLoading(false);
                         updateUI();
                     } else if (attempts >= 60) {
                         clearInterval(state.maskPollingInterval);
-                        setLoading(false); alert("Timeout.");
+                        setLoading(false); alert("Timeout awaiting external mask.");
                     }
                 } catch (e) { }
             }, 500);
         }
 
         btns.confirmExt.addEventListener('click', async () => {
-            setLoading(true, "Confirming...");
-            try { await fetch('/external/receive_mask?confirm=true'); updateUI(); } 
+            setLoading(true, "Locking Mask...");
+            try { await fetch('/external/receive_mask?confirm=true'); state.step = 1; updateUI(); } 
             catch (e) { alert("Failed"); } finally { setLoading(false); }
         });
 
-        btns.place.addEventListener('click', () => { state.step = 2; updateUI(); });
-
-        async function handlePlaceSelection(x, y) {
-            setLoading(true, "Recording Target...");
-            try {
-                await fetch('/select_place', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ x, y })
-                });
-                state.step = 3; 
-                if (lastFrameData) renderImage(lastFrameData); 
-                ctx.strokeStyle = "yellow"; ctx.lineWidth = 3;
-                ctx.strokeRect(x-10, y-10, 20, 20);
-                updateUI();
-            } finally { setLoading(false); }
-        }
-
-        // --- UPDATED EXECUTE HANDLER (No Alert, No Reset) ---
+        // 4. Execute
         btns.execute.addEventListener('click', async () => {
-            setLoading(true, "Calculating Grasp...", "Syncing with Point Cloud...");
+            const btn = btns.execute;
+            const originalText = btn.innerText;
+            btn.innerText = "Sending...";
+            btn.disabled = true;
+
             try {
                 const res = await fetch('/execute_grasp', { method: 'POST' });
                 const data = await res.json();
+                
                 if (data.success) {
-                    console.log(`Command Sent! ID: ${data.action_id}`);
-                    // Optional: temporary feedback on button
-                    const origText = btns.execute.innerText;
-                    btns.execute.innerText = "✅ Sent!";
-                    setTimeout(() => btns.execute.innerText = origText, 2000);
+                    btn.style.background = "#10b981"; // Success Green
+                    btn.innerText = "✅ Command Sent!";
+                    // We DO NOT reset here, to allow re-trying
                 } else {
-                    alert(`❌ Failed: ${data.error}`);
+                    btn.style.background = "#ef4444";
+                    btn.innerText = "❌ Failed";
+                    alert(`Error: ${data.error}`);
                 }
-            } catch (e) { alert("Network Error"); }
-            finally { setLoading(false); }
+
+                // Reset button style after 2s
+                setTimeout(() => {
+                    btn.style.background = ""; // Reset to CSS default
+                    btn.innerText = originalText;
+                    btn.disabled = false;
+                }, 2000);
+
+            } catch (e) { 
+                alert("Network Error"); 
+                btn.disabled = false; 
+                btn.innerText = originalText;
+            }
         });
 
+        // 5. Reset
         btns.reset.addEventListener('click', resetState);
 
         async function resetState() {
@@ -357,17 +420,20 @@
             finally { setLoading(false); }
         }
 
+        // --- Rendering ---
+
         function renderImage(b64) {
             const img = new Image();
             img.onload = () => {
                 canvas.width = img.width; canvas.height = img.height;
                 ctx.drawImage(img, 0, 0);
-                if (state.step === 0) drawPoints();
+                // Only draw points during Grasp Definition (Step 0)
+                if (state.step === 0) drawGraspPoints();
             };
             img.src = b64;
         }
 
-        function drawPoints() {
+        function drawGraspPoints() {
             state.points.forEach((p, i) => {
                 ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, Math.PI*2);
                 ctx.fillStyle = state.labels[i] === 1 ? '#10b981' : '#ef4444';
@@ -381,13 +447,37 @@
             ctx.textAlign = "center"; ctx.fillText(text, 320, 240);
         }
 
+        // --- UI Updates ---
+
         function updateUI() {
+            // Button states
             btns.mask.disabled = state.step !== 0 || state.points.length === 0;
             btns.sendExt.disabled = state.step !== 0 || !state.externalServiceOnline;
-            const maskExists = state.step >= 1;
-            btns.place.disabled = !maskExists;
-            btns.execute.disabled = !maskExists;
-            canvas.style.cursor = state.step === 2 ? 'target' : 'crosshair';
+            
+            // Place button is enabled only after Grasp is defined (Step 1+)
+            btns.place.disabled = state.step < 1;
+            if (state.step === 2 || state.step === 3) {
+                btns.place.innerText = "Update Place Target";
+                btns.place.style.border = "1px solid #fff";
+            } else {
+                btns.place.innerText = "Set Place Target";
+                btns.place.style.border = "none";
+            }
+
+            // Execute is enabled only after Place is defined (Step 3)
+            btns.execute.disabled = state.step < 3;
+
+            // Header Instructions
+            if (state.step === 0) {
+                headerInstr.innerHTML = `1. Define Grasp: <span class="highlight-pos">L-Click (Add)</span> | <span class="highlight-neg">R-Click (Remove)</span>`;
+                wrapper.classList.remove('place-mode');
+            } else if (state.step === 1) {
+                headerInstr.innerHTML = `2. Grasp Set. Click <b>"Set Place Target"</b> to continue.`;
+                wrapper.classList.remove('place-mode');
+            } else if (state.step >= 2) {
+                headerInstr.innerHTML = `3. Define Place: <span class="highlight-place">Click anywhere</span> to set goal.`;
+                wrapper.classList.add('place-mode');
+            }
         }
 
         function setLoading(active, text="Processing...", subtext="") {

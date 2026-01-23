@@ -25,7 +25,7 @@ from PIL import Image, ImageDraw
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 from generated.image_pb2 import ImageData
-from generated.action_pb2 import GraspGoal
+from generated.action_pb2 import GraspGoal, MotionGoal
 
 # --- Configuration ---
 CONFIG = {
@@ -34,7 +34,8 @@ CONFIG = {
     'CAMERA_ID': "SN_57524755", 
     'ZENOH_ROUTER': "tcp/10.42.0.220:7447#so_sndbuf=52428800",
     'ACTION_GRASP_GOAL': "arm/action/grasp/goal",
-    'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://noelia-pupillary-uneccentrically.ngrok-free.dev/api/process_image")
+    'ACTION_MOTION_GOAL': "arm/action/goal",
+    'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://192.168.20.59:8019/api/process_image")
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -69,14 +70,26 @@ class ImageProcessor:
         return Image.open(io.BytesIO(base64.b64decode(base64_str))).convert("RGB")
 
     @staticmethod
-    def create_overlay(image: Image.Image, mask_uint8: np.ndarray, points=None, labels=None) -> Image.Image:
-        # Note: mask_uint8 must be (H, W) and match image dimensions
-        overlay_rgba = Image.new("RGBA", image.size, (30, 144, 255, 0))
+    def create_overlay(image: Image.Image, grasp_mask: np.ndarray = None, place_mask: np.ndarray = None, points=None, labels=None) -> Image.Image:
+        overlay_rgba = Image.new("RGBA", image.size, (0, 0, 0, 0))
         overlay_np = np.array(overlay_rgba)
         
-        # Alpha channel: 150 where mask is present
-        overlay_np[..., 3] = np.where(mask_uint8 > 0, 150, 0).astype(np.uint8)
-        
+        # 1. Apply Grasp Mask (Red)
+        if grasp_mask is not None:
+            mask_indices = grasp_mask > 0
+            overlay_np[mask_indices, 0] = 255 
+            overlay_np[mask_indices, 1] = 30  
+            overlay_np[mask_indices, 2] = 30  
+            overlay_np[mask_indices, 3] = 140 
+
+        # 2. Apply Place Mask (Blue)
+        if place_mask is not None:
+            mask_indices = place_mask > 0
+            overlay_np[mask_indices, 0] = 30  
+            overlay_np[mask_indices, 1] = 144 
+            overlay_np[mask_indices, 2] = 255 
+            overlay_np[mask_indices, 3] = 140 
+
         overlay_layer = Image.fromarray(overlay_np, "RGBA")
         result = Image.alpha_composite(image.convert("RGBA"), overlay_layer).convert("RGB")
 
@@ -92,40 +105,23 @@ class ImageProcessor:
 
     @staticmethod
     def normalize_mask(mask_raw: np.ndarray, target_pil_size: tuple) -> np.ndarray:
-        """
-        Robustly ensures mask is 2D (H, W), binary uint8 (0 or 255), 
-        and resized to match the target PIL size (W, H).
-        """
-        # 1. Ensure 2D (H, W) by squeezing extra dimensions
         mask = np.squeeze(mask_raw)
-        if mask.ndim > 2:
-             # Safety fallback: if squeeze still leaves 3D (e.g. C,H,W), take first channel
-             logger.warning(f"Mask raw shape {mask_raw.shape} resulted in {mask.shape} after squeeze. Taking first channel.")
-             mask = mask[0, :, :]
+        if mask.ndim > 2: mask = mask[0, :, :]
 
-        # 2. Convert to strictly binary uint8 (0 or 255)
         if mask.dtype == bool:
             mask_uint8 = (mask * 255).astype(np.uint8)
         elif np.issubdtype(mask.dtype, np.floating):
-            # Threshold floats. If logits (neg/pos), threshold 0. If prob (0-1), threshold 0.5.
             threshold = 0.0 if (mask.min() < 0 or mask.max() > 1.0) else 0.5
             mask_uint8 = (mask > threshold).astype(np.uint8) * 255
         else:
-            # Handle integer input
             mask_uint8 = mask.astype(np.uint8)
-            # If it's 0/1, convert to 0/255
-            if mask_uint8.max() <= 1:
-                 mask_uint8 *= 255
-            # Ensure strictly binary 0 or 255
+            if mask_uint8.max() <= 1: mask_uint8 *= 255
             mask_uint8 = (mask_uint8 > 127).astype(np.uint8) * 255
 
-        # 3. Resize to match target dimensions if necessary
         target_w, target_h = target_pil_size
         current_h, current_w = mask_uint8.shape
 
         if (current_w, current_h) != (target_w, target_h):
-             logger.info(f"Resizing mask from ({current_w}, {current_h}) to ({target_w}, {target_h})")
-             # Use PIL for resizing binary masks (NEAREST neighbor is crucial)
              mask_pil = Image.fromarray(mask_uint8)
              mask_pil = mask_pil.resize((target_w, target_h), Image.Resampling.NEAREST)
              mask_uint8 = np.array(mask_pil)
@@ -149,11 +145,17 @@ class ZenohStreamer:
     def __init__(self):
         self.session = None
         self.subscriber_rgb = None
-        self.subscriber_pc = None
+        self.subscriber_grasp_pc = None # Renamed for clarity
+        self.subscriber_goal_pc = None  # NEW
         self.publisher_mask = None
+        self.publisher_goal_mask = None 
         self.publisher_action = None
+        self.publisher_motion = None # [NEW] Publisher for MotionGoal
+        
         self._latest_image = None
-        self._latest_mask_pc = None
+        self._latest_grasp_pc = None # Stores raw bytes of grasp PC
+        self._latest_goal_pc = None  # Stores raw bytes of place/goal PC
+        
         self._lock = threading.Lock()
         self._is_streaming = False
         self._init_session()
@@ -175,14 +177,30 @@ class ZenohStreamer:
             if self._is_streaming: return True
             if not self.session: self._init_session()
             camera_id = CONFIG['CAMERA_ID']
+            
+            # Topics
             rgb_topic = f"env/{camera_id}/rgb"
+            
+            # Grasp (Subject) Topics
             mask_topic = f"env/{camera_id}/mask"
-            pc_topic = f"env/{camera_id}/mask_pc"
+            mask_pc_topic = f"env/{camera_id}/mask_pc"
+            
+            # Place (Goal) Topics
+            goal_mask_topic = f"env/{camera_id}/goal_mask"
+            goal_mask_pc_topic = f"env/{camera_id}/goal_mask_pc"
+            
             try:
+                # Subscribers
                 self.subscriber_rgb = self.session.declare_subscriber(rgb_topic, self._on_image_update)
-                self.subscriber_pc = self.session.declare_subscriber(pc_topic, self._on_pc_update)
+                self.subscriber_grasp_pc = self.session.declare_subscriber(mask_pc_topic, self._on_grasp_pc_update)
+                self.subscriber_goal_pc = self.session.declare_subscriber(goal_mask_pc_topic, self._on_goal_pc_update)
+                
+                # Publishers
                 self.publisher_mask = self.session.declare_publisher(mask_topic)
+                self.publisher_goal_mask = self.session.declare_publisher(goal_mask_topic) 
                 self.publisher_action = self.session.declare_publisher(CONFIG['ACTION_GRASP_GOAL'])
+                self.publisher_motion = self.session.declare_publisher(CONFIG['ACTION_MOTION_GOAL'])
+                
                 self._is_streaming = True
                 logger.info("Zenoh Stream Started")
                 return True
@@ -194,9 +212,13 @@ class ZenohStreamer:
         with self._lock:
             if not self._is_streaming: return
             if self.subscriber_rgb: self.subscriber_rgb.undeclare(); self.subscriber_rgb = None
-            if self.subscriber_pc: self.subscriber_pc.undeclare(); self.subscriber_pc = None
+            if self.subscriber_grasp_pc: self.subscriber_grasp_pc.undeclare(); self.subscriber_grasp_pc = None
+            if self.subscriber_goal_pc: self.subscriber_goal_pc.undeclare(); self.subscriber_goal_pc = None
             if self.publisher_mask: self.publisher_mask.undeclare(); self.publisher_mask = None
+            if self.publisher_goal_mask: self.publisher_goal_mask.undeclare(); self.publisher_goal_mask = None 
             if self.publisher_action: self.publisher_action.undeclare(); self.publisher_action = None
+            # [NEW] Undeclare Motion Publisher
+            if self.publisher_motion: self.publisher_motion.undeclare(); self.publisher_motion = None
             self._latest_image = None
             self._is_streaming = False
             logger.info("Zenoh Stream Stopped")
@@ -215,16 +237,36 @@ class ZenohStreamer:
         except Exception:
             pass
 
-    def _on_pc_update(self, sample):
+    def _on_grasp_pc_update(self, sample):
         with self._lock:
-            self._latest_mask_pc = sample.payload
-            logger.info(f"Received Mask PC update. Bytes: {len(self._latest_mask_pc)}")
+            self._latest_grasp_pc = sample.payload
+            logger.info(f"Received GRASP Mask PC update. Bytes: {len(self._latest_grasp_pc)}")
 
-    def publish_mask(self, mask_arr: np.ndarray):
-        if not self.publisher_mask and self.session: self.start_stream()
-        if not self.publisher_mask: return
+    def _on_goal_pc_update(self, sample):
+        with self._lock:
+            self._latest_goal_pc = sample.payload
+            logger.info(f"Received GOAL Mask PC update. Bytes: {len(self._latest_goal_pc)}")
+
+    def _compute_centroid(self, pc_bytes):
+        """Helper: Parses raw float32 PC bytes and returns (x, y, z) mean."""
+        if not pc_bytes: return None
         try:
-            # mask_arr must be (H, W) uint8
+            # Parse [N, 3] array
+            data = np.frombuffer(pc_bytes, dtype=np.float32).reshape(-1, 4)
+            if data.size % 4 != 0:
+                raise ValueError
+            points = data[:, :3]
+            if points.shape[0] == 0: return None
+            # 
+            centroid = np.mean(points, axis=0)
+            return centroid
+        except Exception as e:
+            logger.error(f"Failed to compute PC centroid: {e}")
+            return None
+
+    def _publish_mask_bytes(self, publisher, mask_arr: np.ndarray, log_name="Mask"):
+        if not publisher: return
+        try:
             success, encoded_mask = cv2.imencode(".png", mask_arr)
             if success:
                 out = ImageData()
@@ -233,37 +275,86 @@ class ZenohStreamer:
                 out.channels = 1
                 out.format = "png"
                 out.data = encoded_mask.tobytes()
-                with self._lock: self._latest_mask_pc = None 
-                self.publisher_mask.put(out.SerializeToString())
-                logger.info(f"Mask published (Shape: {mask_arr.shape})")
+                publisher.put(out.SerializeToString())
+                logger.info(f"{log_name} published (Shape: {mask_arr.shape})")
         except Exception as e:
-            logger.error(f"Failed to publish mask: {e}")
+            logger.error(f"Failed to publish {log_name}: {e}")
+
+    def publish_mask(self, mask_arr: np.ndarray):
+        with self._lock: self._latest_grasp_pc = None 
+        self._publish_mask_bytes(self.publisher_mask, mask_arr, "Grasp Mask")
+
+    def publish_goal_mask(self, mask_arr: np.ndarray):
+        with self._lock: self._latest_goal_pc = None
+        self._publish_mask_bytes(self.publisher_goal_mask, mask_arr, "Goal Mask")
 
     async def wait_and_publish_action(self, timeout=5.0):
         start_time = time.time()
-        logger.info("Waiting for Mask Point Cloud from Environment...")
-        pc_data = None
+        logger.info("Waiting for Point Clouds (Grasp & Goal)...")
+        
+        grasp_pc = None
+        goal_pc = None
+        
+        # 
+        # Wait loop for both PCs
         while time.time() - start_time < timeout:
             with self._lock:
-                if self._latest_mask_pc is not None:
-                    pc_data = self._latest_mask_pc
+                # We need Grasp PC for sure
+                if self._latest_grasp_pc is not None:
+                    grasp_pc = self._latest_grasp_pc
+                
+                # Check Goal PC
+                if self._latest_goal_pc is not None:
+                    goal_pc = self._latest_goal_pc
+                
+                # Break if we have both (or maybe we proceed if we just have grasp? logic below)
+                if grasp_pc is not None and goal_pc is not None:
                     break
+            
             await asyncio.sleep(0.1)
         
-        if pc_data is None: return False, "Timeout waiting for Mask PC"
-
+        if grasp_pc is None:
+            return False, "Timeout waiting for Grasp Object Point Cloud"
+        
+        # We proceed even if goal_pc is missing, but log a warning (place_pose will be 0,0,0)
+        if goal_pc is None:
+            logger.warning("Timeout waiting for Goal Point Cloud! Place pose will be invalid.")
+        
         try:
             action_id = str(uuid.uuid4())
             goal = GraspGoal()
             goal.action_id = action_id
-            goal.mask_pc = bytes(pc_data)
+            goal.approach_dist = 0.10
+            goal.retract_dist = 0.075
+            goal.hover_dist = 0.15
+            
+            # 1. Grasp PC
+            goal.mask_pc = bytes(grasp_pc)
+
+            # 2. Place Pose (from Goal PC Centroid)
+            place_centroid = self._compute_centroid(bytes(goal_pc))
+            if place_centroid is not None:
+                goal.place_pose.position.x = float(place_centroid[0])
+                goal.place_pose.position.y = float(place_centroid[1])
+                goal.place_pose.position.z = float(place_centroid[2])
+                # Default downward orientation (same as approach)
+                goal.place_pose.quaternion.x = 0.0
+                goal.place_pose.quaternion.y = 0.7071
+                goal.place_pose.quaternion.z = 0.0
+                goal.place_pose.quaternion.w = 0.7071
+            else:
+                logger.warning("Could not calculate place centroid. Defaults used.")
+
+            # 4. Standard approach poses (defaults)
             goal.initial_approach_pose.position.x = 0.3
             goal.initial_approach_pose.position.y = 0.0
-            goal.initial_approach_pose.position.z = 0.28
+            goal.initial_approach_pose.position.z = 0.3
             goal.initial_approach_pose.quaternion.x = 0.0
             goal.initial_approach_pose.quaternion.y = 0.229
             goal.initial_approach_pose.quaternion.z = 0
             goal.initial_approach_pose.quaternion.w = 0.973
+            
+            # Copy approach to retract
             goal.retract_pose.CopyFrom(goal.initial_approach_pose)
 
             if not self.publisher_action: self.start_stream()
@@ -273,6 +364,34 @@ class ZenohStreamer:
         except Exception as e:
             return False, str(e)
 
+    # [NEW] Function to send the Reset/Home pose
+    def send_reset_pose(self):
+        if not self.publisher_motion:
+            logger.warning("Cannot send Reset Pose: Publisher not active")
+            return
+
+        try:
+            goal = MotionGoal()
+            goal.action_id = str(uuid.uuid4())
+            goal.speed_scale = 0.5 # Move at 50% speed for safety
+            
+            # Define Home Pose (Adjust these coordinates to your safe home position)
+            # Example: High up, centered
+            goal.target_pose.position.x = 0.3
+            goal.target_pose.position.y = 0.0
+            goal.target_pose.position.z = 0.3
+            
+            # Orientation: Pointing down
+            goal.target_pose.quaternion.x = 0.0
+            goal.target_pose.quaternion.y = 0.229
+            goal.target_pose.quaternion.z = 0.0
+            goal.target_pose.quaternion.w = 0.973
+            
+            self.publisher_motion.put(goal.SerializeToString())
+            logger.info(f"Sent Reset MotionGoal: {goal.action_id}")
+        except Exception as e:
+            logger.error(f"Failed to send Reset Pose: {e}")
+            
     def get_latest_frame(self):
         with self._lock:
             return self._latest_image.copy() if self._latest_image else None
@@ -335,7 +454,8 @@ class SessionManager:
     def reset(self):
         self.current_image = None
         self.release_inference()
-        self.current_mask = None
+        self.current_grasp_mask = None
+        self.current_place_mask = None 
         self.current_overlay = None
         self.external_mask_buffer = None
         self.external_mask_locked = False
@@ -345,17 +465,27 @@ class SessionManager:
         self.release_inference() 
         self.current_image = image
         self.inference_state = inference_state
-        self.current_mask = None
+        self.current_grasp_mask = None
+        self.current_place_mask = None
         self.current_overlay = None
         self.external_mask_buffer = None
         self.external_mask_locked = False
-        self.mask_source_mode = None
 
     def release_inference(self):
         if hasattr(self, 'inference_state') and self.inference_state and hasattr(self.inference_state, 'clear'):
             try: self.inference_state.clear()
             except: pass
         self.inference_state = None
+        
+    def update_overlay(self, points=None, labels=None):
+        if self.current_image:
+            self.current_overlay = ImageProcessor.create_overlay(
+                self.current_image, 
+                self.current_grasp_mask, 
+                self.current_place_mask, 
+                points, 
+                labels
+            )
 
 # --- FastAPI App ---
 app = FastAPI(title="SAM3 Robot Teleop")
@@ -369,18 +499,29 @@ zenoh_streamer = ZenohStreamer()
 zenoh_streamer.start_stream()
 
 def _capture_and_encode_latest_frame():
-    latest_img = zenoh_streamer.get_latest_frame()
-    if latest_img is None:
-        raise ValueError("No video stream frame available yet.")
-    logger.info(f"Encoding new frame (Full Res: {latest_img.size})...")
-    inf_state = model_handler.get_inference_state(latest_img)
-    session_manager.set_image(latest_img, inf_state)
+    if session_manager.current_image is None:
+        latest_img = zenoh_streamer.get_latest_frame()
+        if latest_img is None:
+            raise ValueError("No video stream frame available yet.")
+        logger.info(f"Encoding new frame (Full Res: {latest_img.size})...")
+        inf_state = model_handler.get_inference_state(latest_img)
+        session_manager.set_image(latest_img, inf_state)
 
 # --- Endpoints ---
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+import logging
+
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Filter out the /get_frame logs from the access log
+        return record.getMessage().find("/get_frame") == -1
+
+# Apply the filter to the uvicorn access logger
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
 
 @app.get("/get_frame")
 def get_frame():
@@ -404,6 +545,7 @@ def get_frame():
 @app.post("/reset")
 async def reset_session():
     session_manager.reset()
+    zenoh_streamer.send_reset_pose()
     return {"success": True}
 
 @app.post("/predict_mask")
@@ -411,35 +553,51 @@ def predict_mask(data: PointsData):
     if not data.points:
         return JSONResponse(status_code=400, content={"error": "No points provided"})
     try:
-        # 1. Capture Full Res
         _capture_and_encode_latest_frame()
         points_arr = np.array(data.points)
         labels_arr = np.array(data.labels)
         
-        # 2. SAM Prediction
         masks, scores = model_handler.predict(session_manager.inference_state, points_arr, labels_arr)
         
-        # 3. Normalize Mask (Critical Fix: Resize to match image dimensions)
-        target_size = session_manager.current_image.size # (W, H)
+        target_size = session_manager.current_image.size
         final_mask = ImageProcessor.normalize_mask(masks[0], target_size)
         
-        session_manager.current_mask = final_mask
+        session_manager.current_grasp_mask = final_mask
         session_manager.mask_source_mode = 'sam3'
         
-        # 4. Publish correct size mask
-        zenoh_streamer.publish_mask(session_manager.current_mask)
-        
-        # 5. Create Overlay
-        overlay_img = ImageProcessor.create_overlay(
-            session_manager.current_image, final_mask, points_arr, labels_arr
-        )
-        session_manager.current_overlay = overlay_img
+        zenoh_streamer.publish_mask(session_manager.current_grasp_mask)
+        session_manager.update_overlay(points_arr, labels_arr)
 
         return {"success": True}
     except Exception as e:
         logger.error(f"Prediction Error: {e}")
-        import traceback
-        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/select_place")
+def select_place(data: PlaceData):
+    try:
+        if session_manager.current_image is None:
+            _capture_and_encode_latest_frame()
+
+        points_arr = np.array([[data.x, data.y]])
+        labels_arr = np.array([1]) 
+
+        logger.info(f"Generating Place Mask at {data.x}, {data.y}")
+
+        masks, scores = model_handler.predict(session_manager.inference_state, points_arr, labels_arr)
+
+        target_size = session_manager.current_image.size
+        final_mask = ImageProcessor.normalize_mask(masks[0], target_size)
+
+        session_manager.current_place_mask = final_mask
+        
+        zenoh_streamer.publish_goal_mask(session_manager.current_place_mask)
+        session_manager.update_overlay()
+
+        return {"success": True, "message": "Place mask published"}
+
+    except Exception as e:
+        logger.error(f"Place Selection Error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/external/send_image")
@@ -486,7 +644,6 @@ async def external_receive_mask_post(data: ExternalMaskData):
         mask_img = ImageProcessor.from_base64(mask_data).convert('L')
         mask_array = np.array(mask_img)
         
-        # Normalize Mask (Resize to match current image)
         target_size = session_manager.current_image.size
         final_mask = ImageProcessor.normalize_mask(mask_array, target_size)
 
@@ -503,13 +660,14 @@ def external_receive_mask_get(confirm: bool = False):
         return JSONResponse(status_code=400, content={"error": "No mask in buffer."})
     try:
         mask_buffer = session_manager.external_mask_buffer
-        overlay_img = ImageProcessor.create_overlay(session_manager.current_image, mask_buffer)
+        overlay_img = ImageProcessor.create_overlay(session_manager.current_image, grasp_mask=mask_buffer)
+        
         if confirm:
-            session_manager.current_mask = mask_buffer.copy()
+            session_manager.current_grasp_mask = mask_buffer.copy()
             session_manager.current_overlay = overlay_img
             session_manager.external_mask_locked = True
             session_manager.mask_source_mode = 'external'
-            zenoh_streamer.publish_mask(session_manager.current_mask)
+            zenoh_streamer.publish_mask(session_manager.current_grasp_mask)
             return {"success": True, "locked": True}
         else:
             session_manager.current_overlay = overlay_img
@@ -519,18 +677,14 @@ def external_receive_mask_get(confirm: bool = False):
 
 @app.post("/execute_grasp")
 async def execute_grasp():
-    if session_manager.current_mask is None:
-        return JSONResponse(status_code=400, content={"error": "No mask generated yet."})
+    if session_manager.current_grasp_mask is None:
+        return JSONResponse(status_code=400, content={"error": "No grasp mask generated yet."})
+    
     success, result = await zenoh_streamer.wait_and_publish_action(timeout=5.0)
     if success:
-        # Don't clear overlay, allow re-execution
         return {"success": True, "action_id": result, "message": "Grasp command sent!"}
     else:
         return JSONResponse(status_code=504, content={"error": result})
-
-@app.post("/select_place")
-async def select_place(data: PlaceData):
-    return {"success": True}
 
 def signal_handler(sig, frame):
     zenoh_streamer.close()
@@ -540,4 +694,4 @@ signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=50052, workers=1)
+    uvicorn.run(app, host="0.0.0.0", workers=1)
