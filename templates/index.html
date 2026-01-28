@@ -170,7 +170,9 @@
             points: [], // Grasp Points
             labels: [], // Grasp Labels
             externalServiceOnline: false,
-            clickTimer: null
+            clickTimer: null,
+            externalGraspMaskReceived: false, // Track if external grasp mask is received
+            externalPlaceMaskReceived: false // Track if external place mask is received
         };
 
         const canvas = document.getElementById('mainCanvas');
@@ -334,38 +336,118 @@
             try {
                 const sendRes = await fetch('/external/send_image', { method: 'POST' });
                 if (!sendRes.ok) throw new Error("Failed to send");
-                setLoading(true, "Waiting for External Mask...", "Polling...");
+                setLoading(true, "Waiting for External Masks...", "Polling grasp mask and place target...");
                 startMaskPolling();
             } catch (e) { alert(e.message); setLoading(false); }
         });
 
         function startMaskPolling() {
             let attempts = 0;
+            // Reset mask received states
+            state.externalGraspMaskReceived = false;
+            state.externalPlaceMaskReceived = false;
+            
             if (state.maskPollingInterval) clearInterval(state.maskPollingInterval);
             state.maskPollingInterval = setInterval(async () => {
                 attempts++;
                 try {
-                    const res = await fetch('/external/receive_mask?confirm=false');
-                    const data = await res.json();
-                    if (data.success && data.preview) {
-                        clearInterval(state.maskPollingInterval);
-                        state.step = 1; // Treat as if Grasp is generated
-                        btns.sendExt.style.display = 'none';
-                        btns.confirmExt.style.display = 'block';
-                        setLoading(false);
-                        updateUI();
-                    } else if (attempts >= 60) {
-                        clearInterval(state.maskPollingInterval);
-                        setLoading(false); alert("Timeout awaiting external mask.");
+                    // Poll both interfaces simultaneously
+                    const [graspCheckRes, placeRes] = await Promise.all([
+                        fetch('/check_grasp_mask').catch(() => null),
+                        fetch('/check_place_mask').catch(() => null)
+                    ]);
+                    
+                    // Check grasp mask (either in buffer or confirmed)
+                    if (graspCheckRes && graspCheckRes.ok) {
+                        const graspCheckData = await graspCheckRes.json();
+                        if (graspCheckData.success && graspCheckData.has_grasp_mask && !state.externalGraspMaskReceived) {
+                            state.externalGraspMaskReceived = true;
+                            console.log("External grasp mask detected:", graspCheckData.is_confirmed ? "confirmed" : "in buffer");
+                            // Update loading text
+                            const placeStatus = state.externalPlaceMaskReceived ? "✓" : "waiting";
+                            setLoading(true, "Waiting for External Masks...", `Grasp: ✓ | Place: ${placeStatus}`);
+                        }
                     }
-                } catch (e) { }
+                    
+                    // Check place mask
+                    if (placeRes && placeRes.ok) {
+                        const placeData = await placeRes.json();
+                        if (placeData.success && placeData.has_place_mask && !state.externalPlaceMaskReceived) {
+                            state.externalPlaceMaskReceived = true;
+                            console.log("External place mask received");
+                            // Update loading text
+                            const graspStatus = state.externalGraspMaskReceived ? "✓" : "waiting";
+                            setLoading(true, "Waiting for External Masks...", `Grasp: ${graspStatus} | Place: ✓`);
+                        }
+                    }
+                    
+                    // Update loading text with current status
+                    if (attempts % 4 === 0) { // Update every 2 seconds
+                        const graspStatus = state.externalGraspMaskReceived ? "✓" : "waiting";
+                        const placeStatus = state.externalPlaceMaskReceived ? "✓" : "waiting";
+                        setLoading(true, "Waiting for External Masks...", `Grasp: ${graspStatus} | Place: ${placeStatus}`);
+                    }
+                    
+                    // If both masks are received, proceed
+                    if (state.externalGraspMaskReceived && state.externalPlaceMaskReceived) {
+                        clearInterval(state.maskPollingInterval);
+                        
+                        // Check if grasp mask needs to be confirmed
+                        try {
+                            const graspCheckRes2 = await fetch('/check_grasp_mask');
+                            if (graspCheckRes2.ok) {
+                                const graspCheckData2 = await graspCheckRes2.json();
+                                
+                                // If mask is not confirmed yet, confirm it
+                                if (graspCheckData2.has_grasp_mask && !graspCheckData2.is_confirmed) {
+                                    const confirmRes = await fetch('/external/receive_mask?confirm=true');
+                                    if (!confirmRes.ok) {
+                                        console.error("Failed to confirm grasp mask");
+                                        return;
+                                    }
+                                }
+                                
+                                // Both masks received and confirmed, ready to execute
+                                state.step = 3; // Ready to Execute
+                                btns.sendExt.style.display = 'none';
+                                btns.confirmExt.style.display = 'none'; // Auto-confirmed, no need for manual confirm
+                                setLoading(false);
+                                updateUI();
+                                return;
+                            }
+                        } catch (e) {
+                            console.error("Error confirming grasp mask:", e);
+                        }
+                    }
+                    
+                    // Timeout handling
+                    if (attempts >= 120) { // 60 seconds (120 * 500ms)
+                        clearInterval(state.maskPollingInterval);
+                        setLoading(false);
+                        const missing = [];
+                        if (!state.externalGraspMaskReceived) missing.push("grasp mask");
+                        if (!state.externalPlaceMaskReceived) missing.push("place mask");
+                        alert(`Timeout awaiting external masks. Missing: ${missing.join(", ")}`);
+                    }
+                } catch (e) {
+                    console.error("Mask polling error:", e);
+                }
             }, 500);
         }
 
         btns.confirmExt.addEventListener('click', async () => {
             setLoading(true, "Locking Mask...");
-            try { await fetch('/external/receive_mask?confirm=true'); state.step = 1; updateUI(); } 
-            catch (e) { alert("Failed"); } finally { setLoading(false); }
+            try { 
+                await fetch('/external/receive_mask?confirm=true'); 
+                state.externalGraspMaskReceived = true;
+                // If place mask also received, go to step 3, otherwise step 1
+                if (state.externalPlaceMaskReceived) {
+                    state.step = 3;
+                } else {
+                    state.step = 1;
+                }
+                updateUI(); 
+            } catch (e) { alert("Failed"); } finally { setLoading(false); }
         });
 
         // 4. Execute

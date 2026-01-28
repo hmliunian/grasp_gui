@@ -35,7 +35,8 @@ CONFIG = {
     'ZENOH_ROUTER': "tcp/10.42.0.220:7447#so_sndbuf=52428800",
     'ACTION_GRASP_GOAL': "arm/action/grasp/goal",
     'ACTION_MOTION_GOAL': "arm/action/goal",
-    'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://192.168.20.59:8019/api/process_image")
+    'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://192.168.20.59:50056/api/process_image")
+    # 'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://localhost:50053/api/process_image")
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -325,8 +326,9 @@ class ZenohStreamer:
             goal = GraspGoal()
             goal.action_id = action_id
             goal.approach_dist = 0.10
-            goal.retract_dist = 0.075
-            goal.hover_dist = 0.15
+            goal.retract_dist = 0.15
+            goal.hover_dist = 0.05
+            goal.max_attempt = 5
             
             # 1. Grasp PC
             goal.mask_pc = bytes(grasp_pc)
@@ -339,9 +341,9 @@ class ZenohStreamer:
                 goal.place_pose.position.z = float(place_centroid[2])
                 # Default downward orientation (same as approach)
                 goal.place_pose.quaternion.x = 0.0
-                goal.place_pose.quaternion.y = 0.7071
-                goal.place_pose.quaternion.z = 0.0
-                goal.place_pose.quaternion.w = 0.7071
+                goal.place_pose.quaternion.y = 0.229
+                goal.place_pose.quaternion.z = 0
+                goal.place_pose.quaternion.w = 0.973
             else:
                 logger.warning("Could not calculate place centroid. Defaults used.")
 
@@ -353,7 +355,6 @@ class ZenohStreamer:
             goal.initial_approach_pose.quaternion.y = 0.229
             goal.initial_approach_pose.quaternion.z = 0
             goal.initial_approach_pose.quaternion.w = 0.973
-            
             # Copy approach to retract
             goal.retract_pose.CopyFrom(goal.initial_approach_pose)
 
@@ -542,6 +543,29 @@ def get_frame():
         "frame_data": ImageProcessor.to_base64(img, "JPEG", quality=80)
     }
 
+@app.get("/check_place_mask")
+def check_place_mask():
+    """Check if place mask exists"""
+    has_place_mask = session_manager.current_place_mask is not None
+    return {
+        "success": True,
+        "has_place_mask": has_place_mask
+    }
+
+@app.get("/check_grasp_mask")
+def check_grasp_mask():
+    """Check if grasp mask exists (either in buffer or confirmed)"""
+    has_buffer = session_manager.external_mask_buffer is not None
+    has_confirmed = session_manager.current_grasp_mask is not None
+    is_locked = session_manager.external_mask_locked
+    
+    return {
+        "success": True,
+        "has_grasp_mask": has_buffer or has_confirmed,
+        "in_buffer": has_buffer,
+        "is_confirmed": has_confirmed and is_locked
+    }
+
 @app.post("/reset")
 async def reset_session():
     session_manager.reset()
@@ -616,7 +640,7 @@ async def external_send_image():
         session_manager.mask_source_mode = 'external'
         response = await loop.run_in_executor(
             None, 
-            lambda: requests.post(CONFIG['EXTERNAL_SERVICE_URL'], json=payload, timeout=10)
+            lambda: requests.post(CONFIG['EXTERNAL_SERVICE_URL'], json=payload, timeout=60)
         )
         response.raise_for_status()
         return {"success": True}
@@ -637,42 +661,168 @@ async def external_health():
 async def external_receive_mask_post(data: ExternalMaskData):
     if session_manager.current_image is None:
         return JSONResponse(status_code=400, content={"error": "No image loaded"})
+    
     if session_manager.external_mask_locked:
-        return {"success": False, "message": "Mask already confirmed."}
+        return {"success": False, "message": "Mask already confirmed. No longer accepting new masks."}
+    
     try:
         mask_data = data.mask_data
-        mask_img = ImageProcessor.from_base64(mask_data).convert('L')
-        mask_array = np.array(mask_img)
-        
-        target_size = session_manager.current_image.size
-        final_mask = ImageProcessor.normalize_mask(mask_array, target_size)
+        if not mask_data:
+            return JSONResponse(status_code=400, content={"error": "mask_data not provided"})
 
-        session_manager.external_mask_buffer = final_mask
-        return {"success": True, "message": "Mask stored in buffer"}
+        # Decode Base64 mask
+        mask_img = ImageProcessor.from_base64(mask_data).convert('L')
+        
+        # Resize to current_image dimensions
+        target_size = session_manager.current_image.size
+        # Use simple resizing or normalization logic
+        # We can use Image.resize directly here as in your flask snippet
+        mask_img = mask_img.resize(target_size, Image.Resampling.LANCZOS)
+        
+        mask_array = np.array(mask_img, dtype=np.uint8)
+        mask_array = np.clip(mask_array, 0, 255)
+        
+        # Store in buffer
+        session_manager.external_mask_buffer = mask_array
+        
+        return {"success": True, "message": "Mask received and stored in buffer"}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"Failed to process mask: {str(e)}"})
+        import traceback
+        logger.error(traceback.format_exc())
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/external/receive_mask")
 def external_receive_mask_get(confirm: bool = False):
+    """
+    GET request to handle preview or confirmation logic.
+    Corresponds to the Flask 'GET' logic block.
+    """
     if session_manager.current_image is None:
-        return JSONResponse(status_code=400, content={"error": "No image captured yet."})
+        return JSONResponse(status_code=400, content={"error": "No image loaded"})
+    
     if session_manager.external_mask_buffer is None:
-        return JSONResponse(status_code=400, content={"error": "No mask in buffer."})
+        return JSONResponse(status_code=400, content={"error": "No mask in buffer. Please wait for external service to send mask."})
+
     try:
-        mask_buffer = session_manager.external_mask_buffer
-        overlay_img = ImageProcessor.create_overlay(session_manager.current_image, grasp_mask=mask_buffer)
-        
         if confirm:
-            session_manager.current_grasp_mask = mask_buffer.copy()
-            session_manager.current_overlay = overlay_img
-            session_manager.external_mask_locked = True
+            # Confirm button clicked: set current_mask and lock
+            if session_manager.external_mask_locked:
+                # Already confirmed, return current mask state
+                overlay_base64 = ImageProcessor.to_base64(session_manager.current_overlay, "PNG")
+                
+                # Convert current mask to base64
+                mask_pil = Image.fromarray(session_manager.current_grasp_mask, mode='L')
+                mask_base64 = ImageProcessor.to_base64(mask_pil, "PNG")
+                
+                return {
+                    "success": True,
+                    "overlay_data": overlay_base64,
+                    "mask_data": mask_base64,
+                    "image_size": {"width": session_manager.current_image.width, "height": session_manager.current_image.height},
+                    "locked": True
+                }
+            
+            # Not locked yet, proceed to lock
+            session_manager.current_grasp_mask = session_manager.external_mask_buffer.copy()
             session_manager.mask_source_mode = 'external'
+            
+            # Create overlay using stored class method
+            # Include both grasp mask and place mask if exists
+            session_manager.update_overlay()
+            
+            # Lock: no longer accept new masks
+            session_manager.external_mask_locked = True
+            
+            # Publish to Zenoh
             zenoh_streamer.publish_mask(session_manager.current_grasp_mask)
-            return {"success": True, "locked": True}
+            
+            # Return response
+            overlay_base64 = ImageProcessor.to_base64(session_manager.current_overlay, "PNG")
+            mask_pil = Image.fromarray(session_manager.current_grasp_mask, mode='L')
+            mask_base64 = ImageProcessor.to_base64(mask_pil, "PNG")
+
+            return {
+                "success": True,
+                "overlay_data": overlay_base64,
+                "mask_data": mask_base64,
+                "image_size": {"width": session_manager.current_image.width, "height": session_manager.current_image.height}
+            }
+            
         else:
-            session_manager.current_overlay = overlay_img
-            return {"success": True, "preview": True}
+            # Preview: return buffer mask for display (without locking)
+            # Create temporary overlay
+            preview_overlay = ImageProcessor.create_overlay(
+                session_manager.current_image, 
+                grasp_mask=session_manager.external_mask_buffer
+            )
+            
+            overlay_base64 = ImageProcessor.to_base64(preview_overlay, "PNG")
+            
+            mask_pil = Image.fromarray(session_manager.external_mask_buffer, mode='L')
+            mask_base64 = ImageProcessor.to_base64(mask_pil, "PNG")
+            
+            return {
+                "success": True,
+                "overlay_data": overlay_base64,
+                "mask_data": mask_base64,
+                "image_size": {"width": session_manager.current_image.width, "height": session_manager.current_image.height},
+                "preview": True
+            }
+
     except Exception as e:
+        import traceback
+        logger.error(traceback.format_exc())
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/external/receive_place_target")
+async def external_receive_place_target(data: ExternalMaskData):
+    """
+    Receive place target mask from external service.
+    Similar to /external/receive_mask but for place target (goal mask).
+    Returns mask data for frontend overlay display.
+    """
+    if session_manager.current_image is None:
+        return JSONResponse(status_code=400, content={"error": "No image loaded"})
+    
+    try:
+        mask_data = data.mask_data
+        if not mask_data:
+            return JSONResponse(status_code=400, content={"error": "mask_data not provided"})
+
+        # Decode Base64 mask
+        mask_img = ImageProcessor.from_base64(mask_data).convert('L')
+        
+        # Resize to current_image dimensions
+        target_size = session_manager.current_image.size
+        mask_img = mask_img.resize(target_size, Image.Resampling.LANCZOS)
+        
+        mask_array = np.array(mask_img, dtype=np.uint8)
+        mask_array = np.clip(mask_array, 0, 255)
+        
+        # Store directly to current_place_mask (not buffer)
+        session_manager.current_place_mask = mask_array
+        
+        # Publish to Zenoh
+        zenoh_streamer.publish_goal_mask(session_manager.current_place_mask)
+        
+        # Convert mask to base64 for frontend overlay
+        mask_pil = Image.fromarray(mask_array, mode='L')
+        mask_base64 = ImageProcessor.to_base64(mask_pil, "PNG")
+        
+        logger.info(f"Place target mask received and published. Size: {mask_array.shape}")
+        
+        return {
+            "success": True, 
+            "message": "Place target mask received and published",
+            "place_mask_data": mask_base64,
+            "image_size": {
+                "width": session_manager.current_image.width, 
+                "height": session_manager.current_image.height
+            }
+        }
+    except Exception as e:
+        import traceback
+        logger.error(traceback.format_exc())
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/execute_grasp")
