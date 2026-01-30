@@ -35,8 +35,8 @@ CONFIG = {
     'ZENOH_ROUTER': "tcp/10.42.0.220:7447#so_sndbuf=52428800",
     'ACTION_GRASP_GOAL': "arm/action/grasp/goal",
     'ACTION_MOTION_GOAL': "arm/action/goal",
-    'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://192.168.20.59:50056/api/process_image")
     # 'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://localhost:50053/api/process_image")
+    'EXTERNAL_SERVICE_URL': os.getenv("EXTERNAL_SERVICE_URL", "http://192.168.20.59:50056/api/process_image")
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -249,7 +249,7 @@ class ZenohStreamer:
             logger.info(f"Received GOAL Mask PC update. Bytes: {len(self._latest_goal_pc)}")
 
     def _compute_centroid(self, pc_bytes):
-        """Helper: Parses raw float32 PC bytes and returns (x, y, z) mean."""
+        """Helper: Parses raw float32 PC bytes and returns (x, y, z) bounding-box center."""
         if not pc_bytes: return None
         try:
             # Parse [N, 3] array
@@ -258,8 +258,9 @@ class ZenohStreamer:
                 raise ValueError
             points = data[:, :3]
             if points.shape[0] == 0: return None
-            # 
-            centroid = np.mean(points, axis=0)
+            min_xyz = np.min(points, axis=0)
+            max_xyz = np.max(points, axis=0)
+            centroid = (min_xyz + max_xyz) / 2.0
             return centroid
         except Exception as e:
             logger.error(f"Failed to compute PC centroid: {e}")
@@ -325,10 +326,10 @@ class ZenohStreamer:
             action_id = str(uuid.uuid4())
             goal = GraspGoal()
             goal.action_id = action_id
-            goal.approach_dist = 0.10
-            goal.retract_dist = 0.15
+            goal.approach_dist = 0.02
+            goal.retract_dist = 0.02
             goal.hover_dist = 0.05
-            goal.max_attempt = 5
+            goal.max_attempt = 2
             
             # 1. Grasp PC
             goal.mask_pc = bytes(grasp_pc)
